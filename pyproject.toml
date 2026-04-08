@@ -1,0 +1,19 @@
+[project]
+name = "ast-skills"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "lxml>=6.0.2",
+    "matplotlib>=3.10.8",
+    "networkx>=3.6.1",
+    "rich>=14.3.3",
+    "scipy>=1.17.1",
+    "tqdm>=4.67.3",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+]
