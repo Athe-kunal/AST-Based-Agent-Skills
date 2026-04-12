@@ -13,17 +13,23 @@ At 47K Skills, this yields ~1.9M training triplets.
 """
 
 import json
-import logging
 import random
 import re
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import fire
-from openai import OpenAI
 import pydantic
+from loguru import logger
+from openai import OpenAI
 
-from ast_skills.data_gen.skills_data_collect import SkillMdRecord
+from ast_skills.data_gen.skills_data_collect import (
+    SkillMdRecord,
+    collect_skill_md_without_chinese,
+    encode_skill_md_record_batch_custom_id,
+    read_skill_md_records_jsonl,
+    write_skill_md_records_jsonl,
+)
 
 # ──────────────────────────────────────────────
 # SEED QUESTION SCHEMA
@@ -98,11 +104,10 @@ SEED_OPENAI_SYSTEM_MESSAGE = (
 )
 
 DEFAULT_OPENAI_BATCH_MODEL = "gpt-4o-mini"
-LOGGER = logging.getLogger(__name__)
 
 
-class Response(pydantic.BaseModel):
-    """Structured extraction output for a SKILL.md record."""
+class SkillMdExtraction(pydantic.BaseModel):
+    """All fields produced from a single SKILL.md body — nothing else is extracted."""
 
     reasoning: str
     what: str
@@ -110,26 +115,24 @@ class Response(pydantic.BaseModel):
     seed_questions: list[str]
 
 
-SKILL_MD_EXTRACTION_PROMPT = """You are extracting retrieval metadata from one SKILL.md file.
+SKILL_MD_EXTRACTION_SYSTEM_MESSAGE = """You read Agent Skill files (SKILL.md). You respond with one JSON object only, matching the provided schema: keys reasoning, what, why, seed_questions — no markdown fences, no extra keys, no commentary outside JSON. Return exactly those keys in that order. Extract what the skill is for, how it can be used, and why the skill exists based on the SKILL.md content. Be as descriptive as possible while staying grounded in the provided SKILL.md. The what field should describe the skill’s purpose and practical usage. The why field should explain why the skill is there. The seed_questions field should contain exactly 5 questions or tasks that mirror real-world situations where this skill can be used. If required context is missing from the SKILL.md, do not guess; reflect the gap briefly in the relevant fields. Before finalizing, verify that the output is valid JSON and that every field is present.
+"""
 
-## Input
-- relative_path: {relative_path}
-- skill_md_content:
+
+SKILL_MD_EXTRACTION_PROMPT = """You are given the complete markdown source of one SKILL.md file.
+
+----- SKILL.md markdown -----
 {content}
+----- end -----
 
-## Task
-Produce a JSON object with these fields:
-1) reasoning: brief reasoning that explains how you inferred what/why and why each seed question is useful.
-2) what: one concise sentence describing the skill capability.
-3) why: one concise sentence describing when to use this skill.
-4) seed_questions: exactly 5 realistic user questions where this skill is helpful.
+From that markdown alone, fill exactly these four fields (and no others):
 
-## Rules
-- Keep reasoning short (2-5 sentences).
-- what and why must be specific and non-overlapping.
-- Every seed question must be materially different.
-- Do not copy large chunks from the skill file.
-- Output must be valid JSON matching the schema.
+1. reasoning: how the document implies capability vs. trigger, and why each seed question fits.
+2. what: what the skill enables an agent to do (the capability).
+3. why: when or under what situation to apply this skill; must not duplicate `what` wording.
+4. seed_questions: realistic user tasks where this skill is the right tool; each question must differ clearly in intent and wording.
+
+Do not invent tools or steps absent from the file. Paraphrase; do not copy long spans of the source.
 """
 
 
@@ -139,13 +142,42 @@ SKILL_MD_RESPONSE_FORMAT = {
         "name": "skill_md_extraction_response",
         "schema": {
             "type": "object",
+            "description": (
+                "Structured extraction from one SKILL.md: capability, trigger, rationale, "
+                "and five distinct retrieval-style user questions."
+            ),
             "properties": {
-                "reasoning": {"type": "string"},
-                "what": {"type": "string"},
-                "why": {"type": "string"},
+                "reasoning": {
+                    "type": "string",
+                    "description": (
+                        "Explain how the SKILL.md text supports the chosen what/why and why "
+                        "each seed question is a good match."
+                    ),
+                },
+                "what": {
+                    "type": "string",
+                    "description": (
+                        "The concrete capability this skill gives an agent (what it can do), "
+                        "grounded in the file; be concise."
+                    ),
+                },
+                "why": {
+                    "type": "string",
+                    "description": (
+                        "When or in what situation to use this skill (situational trigger); "
+                        "must not repeat the same phrasing as what; be concise."
+                    ),
+                },
                 "seed_questions": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "description": (
+                        "Exactly five realistic user task queries for which this skill is an "
+                        "appropriate retrieval target; each must differ in intent and wording."
+                    ),
+                    "items": {
+                        "type": "string",
+                        "description": "Natural-language user task or query.",
+                    },
                     "minItems": 5,
                     "maxItems": 5,
                 },
@@ -211,47 +243,90 @@ def openai_batch_chat_completion_request(
     }
 
 
+DEFAULT_BATCH_ENDPOINT = "/v1/chat/completions"
+DEFAULT_BATCH_COMPLETION_WINDOW = "24h"
+
+
+def submit_openai_batch_job(
+    batch_input_jsonl_path: str,
+    *,
+    endpoint: str = DEFAULT_BATCH_ENDPOINT,
+    completion_window: str = DEFAULT_BATCH_COMPLETION_WINDOW,
+    metadata_description: str | None = None,
+) -> str:
+    """
+    Upload a Batch input .jsonl (purpose=batch) and create a batch job.
+
+    Requires OPENAI_API_KEY. See https://developers.openai.com/api/docs/guides/batch
+
+    ``metadata_description`` sets batch-level metadata on the Batch object (visible
+    when you retrieve the job), not per-request fields in completion output lines.
+
+    Returns:
+      The batch id (e.g. batch_...) for status checks and result download.
+    """
+    path = Path(batch_input_jsonl_path).expanduser().resolve()
+    logger.info(f"{path=}")
+    if not path.is_file():
+        raise FileNotFoundError(f"Batch input not found: {path}")
+
+    client = OpenAI()
+
+    with path.open("rb") as batch_file:
+        uploaded = client.files.create(file=batch_file, purpose="batch")
+    logger.info(f"{uploaded.id=}")
+
+    create_kwargs: dict = {
+        "input_file_id": uploaded.id,
+        "endpoint": endpoint,
+        "completion_window": completion_window,
+    }
+    if metadata_description:
+        create_kwargs["metadata"] = {"description": metadata_description}
+
+    batch = client.batches.create(**create_kwargs)
+    logger.info(f"{batch.id=}")
+    logger.info(f"{batch.status=}")
+    logger.info(f"{batch.endpoint=}")
+    logger.info(f"{batch.input_file_id=}")
+    return batch.id
+
+
 def build_skill_md_extraction_user_content(skill_md_record: SkillMdRecord) -> str:
     """Build user prompt for extracting what/why/seed questions from SKILL.md."""
     return SKILL_MD_EXTRACTION_PROMPT.format(
-        relative_path=skill_md_record.relative_path,
         content=skill_md_record.content,
     )
 
 
-def _read_skill_md_records(records_path: str) -> list[SkillMdRecord]:
-    """Read SkillMdRecord entries from JSONL."""
-    records: list[SkillMdRecord] = []
-    with Path(records_path).open(encoding="utf-8") as input_file:
-        for line in input_file:
-            line = line.strip()
-            if not line:
-                continue
-            raw_record = json.loads(line)
-            records.append(SkillMdRecord(**raw_record))
-    LOGGER.info(f"{records_path=}")
-    LOGGER.info(f"{len(records)=}")
-    return records
-
-
-def write_openai_batch_skill_md_extraction_jsonl(
-    records_path: str,
+def write_openai_batch_skill_md_extraction_jsonl_for_records(
+    skill_md_records: list[SkillMdRecord],
     output_path: str,
     *,
     model: str = DEFAULT_OPENAI_BATCH_MODEL,
-    max_records: int | None = None,
     max_tokens: int = 1024,
 ) -> int:
-    """Emit OpenAI Batch JSONL for SkillMdRecord extraction with structured output."""
-    skill_md_records = _read_skill_md_records(records_path=records_path)
-    if max_records is not None:
-        skill_md_records = skill_md_records[:max_records]
+    """
+    Emit OpenAI Batch JSONL for SKILL.md extraction, from in-memory records.
 
-    with Path(output_path).open("w", encoding="utf-8") as output_file:
+    Each request ``custom_id`` is at most 500 characters (see
+    ``MAX_OPENAI_BATCH_CUSTOM_ID_LEN`` in ``skills_data_collect``): lossless ``sm1-`` when
+    possible, else compact ``sm2-`` (join batch output to ``skill_md_records.jsonl`` on
+    ``custom_id`` when path/metadata are not embedded).
+
+    ``batches.create(..., metadata={...})`` is separate: job-level tags on the batch
+    object, not echoed per completion line.
+    """
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as output_file:
         for index, skill_md_record in enumerate(skill_md_records):
-            custom_id = _sanitize_custom_id(skill_md_record.relative_path, index)
+            custom_id = encode_skill_md_record_batch_custom_id(
+                skill_md_record,
+                index,
+            )
             messages = [
-                {"role": "system", "content": SEED_OPENAI_SYSTEM_MESSAGE},
+                {"role": "system", "content": SKILL_MD_EXTRACTION_SYSTEM_MESSAGE},
                 {
                     "role": "user",
                     "content": build_skill_md_extraction_user_content(skill_md_record),
@@ -266,9 +341,31 @@ def write_openai_batch_skill_md_extraction_jsonl(
             )
             output_file.write(json.dumps(request_line, ensure_ascii=False) + "\n")
 
-    LOGGER.info(f"{output_path=}")
-    LOGGER.info(f"{len(skill_md_records)=}")
+    logger.info(f"{output_path=}")
+    logger.info(f"{len(skill_md_records)=}")
     return len(skill_md_records)
+
+
+def write_openai_batch_skill_md_extraction_jsonl(
+    records_path: str,
+    output_path: str,
+    *,
+    model: str = DEFAULT_OPENAI_BATCH_MODEL,
+    max_records: int | None = None,
+    max_tokens: int = 1024,
+) -> int:
+    """Emit OpenAI Batch JSONL for SkillMdRecord extraction (read records from JSONL)."""
+    skill_md_records = read_skill_md_records_jsonl(records_path)
+    logger.info(f"{records_path=}")
+    logger.info(f"{len(skill_md_records)=}")
+    if max_records is not None:
+        skill_md_records = skill_md_records[:max_records]
+    return write_openai_batch_skill_md_extraction_jsonl_for_records(
+        skill_md_records,
+        output_path,
+        model=model,
+        max_tokens=max_tokens,
+    )
 
 
 def write_openai_batch_seed_jsonl(
@@ -506,7 +603,7 @@ def generate_full_dataset(
     if max_skills is not None:
         annotations = annotations[:max_skills]
 
-    print(f"Generating seeds for {len(annotations)} Skills (model={model})...")
+    logger.info(f"Generating seeds for {len(annotations)} Skills (model={model})...")
 
     all_seeds = []
     all_triplets = []
@@ -525,13 +622,13 @@ def generate_full_dataset(
             all_triplets.extend(triplets)
 
             if (i + 1) % 25 == 0:
-                print(
+                logger.info(
                     f"  {i+1}/{len(annotations)} Skills processed "
                     f"| {len(all_seeds)} seeds | {len(all_triplets)} triplets"
                 )
 
         except Exception as e:
-            print(f"  Failed on {ann['skill_id']}: {e}")
+            logger.info(f"  Failed on {ann['skill_id']}: {e}")
             continue
 
     # Save triplets
@@ -545,21 +642,22 @@ def generate_full_dataset(
         for s in all_seeds:
             f.write(json.dumps(asdict(s)) + "\n")
 
-    # Print stats
-    print(f"\nDataset generated:")
-    print(f"  Skills:    {len(annotations)}")
-    print(f"  Seeds:     {len(all_seeds)}")
-    print(f"  Triplets:  {len(all_triplets)}")
-    print(f"  Saved to:  {output_path}")
-    print(f"  Seeds at:  {seeds_path}")
+    # Summary stats
+    logger.info("Dataset generated:")
+    logger.info(f"  Skills:    {len(annotations)}")
+    logger.info(f"  Seeds:     {len(all_seeds)}")
+    logger.info(f"  Triplets:  {len(all_triplets)}")
+    logger.info(f"  Saved to:  {output_path}")
+    logger.info(f"  Seeds at:  {seeds_path}")
 
     # Type distribution
     type_counts = {}
     for s in all_seeds:
         type_counts[s.question_type] = type_counts.get(s.question_type, 0) + 1
-    print(f"\n  Seed type distribution:")
+    logger.info("  Seed type distribution:")
     for qtype, count in sorted(type_counts.items()):
-        print(f"    {qtype:15s} {count:6d} ({count/len(all_seeds)*100:.1f}%)")
+        pct = count / len(all_seeds) * 100 if all_seeds else 0.0
+        logger.info(f"    {qtype:15s} {count:6d} ({pct:.1f}%)")
 
 
 class SyntheticDataGenCli:
@@ -567,26 +665,92 @@ class SyntheticDataGenCli:
 
     def extract_skill_md_batch(
         self,
-        records_path: str,
-        batch_output_path: str,
+        skills_root: str,
+        batch_output_path: str = "data/openai_skill_md_batch_input.jsonl",
+        records_jsonl_path: str = "data/skill_md_records.jsonl",
         model: str = DEFAULT_OPENAI_BATCH_MODEL,
         max_records: int | None = None,
         max_tokens: int = 1024,
     ) -> None:
         """
-        Write Batch API JSONL for what/why/seed extraction from SkillMdRecord data.
+        Scan SKILL.md under skills_root, save records JSONL, then write OpenAI Batch input JSONL.
 
-        Input JSONL format:
-          {"relative_path":"...", "content":"..."}
+        By default both outputs go under ``data/``. Set ``records_jsonl_path`` to a falsey
+        string (e.g. empty ``""``) to skip writing the records file.
+
+        Each records line includes ``record_index`` and ``custom_id`` matching the batch job.
+        Each ``custom_id`` is capped at 500 characters; decode with
+        ``decode_skill_md_batch_custom_id`` in ``skills_data_collect``, or join batch lines
+        to this file on exact ``custom_id`` (required for ``sm2-`` compact ids).
         """
-        record_count = write_openai_batch_skill_md_extraction_jsonl(
-            records_path=records_path,
-            output_path=batch_output_path,
+        logger.info(f"{skills_root=}")
+        records = collect_skill_md_without_chinese(skills_root)
+        logger.info(f"collected {len(records)} SKILL.md records")
+
+        if max_records is not None:
+            records = records[:max_records]
+
+        if records_jsonl_path:
+            write_skill_md_records_jsonl(
+                records,
+                records_jsonl_path,
+                include_openai_batch_custom_id=True,
+            )
+            logger.info(f"{records_jsonl_path=}")
+            logger.info(f"{len(records)=}")
+
+        record_count = write_openai_batch_skill_md_extraction_jsonl_for_records(
+            records,
+            batch_output_path,
             model=model,
-            max_records=max_records,
             max_tokens=max_tokens,
         )
-        print(
+        logger.info(
+            f"Wrote {record_count} batch lines to {batch_output_path} "
+            f"(model={model})"
+        )
+
+    def extract_skill_md_batch_from_jsonl(
+        self,
+        records_path: str,
+        batch_output_path: str = "data/openai_skill_md_batch_input.jsonl",
+        records_jsonl_path: str = "data/skill_md_records.jsonl",
+        model: str = DEFAULT_OPENAI_BATCH_MODEL,
+        max_records: int | None = None,
+        max_tokens: int = 4096,
+    ) -> None:
+        """
+        Same as extract_skill_md_batch but read pre-built records JSONL instead of scanning.
+
+        Input JSONL format per line:
+          {"relative_path":"...", "content":"...", "metadata": {...}}
+          (metadata optional; used for storage only, not sent in the extraction prompt.)
+
+        After optional ``max_records`` slicing, writes ``records_jsonl_path`` (default under
+        ``data/``) with ``record_index`` and ``custom_id`` aligned to the batch file. Pass
+        ``records_jsonl_path=""`` to skip that write.
+        """
+        skill_md_records = read_skill_md_records_jsonl(records_path)
+        logger.info(f"{records_path=}")
+        logger.info(f"{len(skill_md_records)=}")
+        if max_records is not None:
+            skill_md_records = skill_md_records[:max_records]
+
+        if records_jsonl_path:
+            write_skill_md_records_jsonl(
+                skill_md_records,
+                records_jsonl_path,
+                include_openai_batch_custom_id=True,
+            )
+            logger.info(f"{records_jsonl_path=}")
+
+        record_count = write_openai_batch_skill_md_extraction_jsonl_for_records(
+            skill_md_records,
+            batch_output_path,
+            model=model,
+            max_tokens=max_tokens,
+        )
+        logger.info(
             f"Wrote {record_count} batch lines to {batch_output_path} "
             f"(model={model})"
         )
@@ -613,7 +777,35 @@ class SyntheticDataGenCli:
             max_skills=max_skills,
             max_tokens=max_tokens,
         )
-        print(f"Wrote {n} batch lines to {batch_output_path} (model={model})")
+        logger.info(f"Wrote {n} batch lines to {batch_output_path} (model={model})")
+
+    def submit_batch(
+        self,
+        batch_input_jsonl_path: str,
+        endpoint: str = DEFAULT_BATCH_ENDPOINT,
+        completion_window: str = DEFAULT_BATCH_COMPLETION_WINDOW,
+        metadata_description: str | None = None,
+    ) -> None:
+        """
+        Upload batch_input_jsonl_path to OpenAI (purpose=batch) and enqueue a batch job.
+
+        Set OPENAI_API_KEY in the environment (e.g. from .env in your shell).
+
+        Example:
+          uv run python ast_skills/data_gen/synthetic_data_gen.py submit_batch batch_input.jsonl
+          uv run python ... submit_batch batch_input.jsonl \\
+            --endpoint=/v1/embeddings --metadata-description="skill-md extraction"
+        """
+        batch_id = submit_openai_batch_job(
+            batch_input_jsonl_path,
+            endpoint=endpoint,
+            completion_window=completion_window,
+            metadata_description=metadata_description,
+        )
+        logger.info(
+            "Poll with the API or dashboard; retrieve output when status is completed. "
+            f"{batch_id=}"
+        )
 
     def full_dataset(
         self,
