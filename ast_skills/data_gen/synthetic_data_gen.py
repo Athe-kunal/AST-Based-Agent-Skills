@@ -27,7 +27,7 @@ from openai import OpenAI
 
 from ast_skills.data_gen.skills_data_collect import (
     SkillMdRecord,
-    collect_skill_md_without_chinese,
+    collect_english_skill_md_records,
     encode_skill_md_record_batch_custom_id,
     read_skill_md_records_jsonl,
     write_skill_md_records_jsonl,
@@ -228,7 +228,7 @@ def openai_batch_chat_completion_request(
 DEFAULT_BATCH_ENDPOINT = "/v1/chat/completions"
 DEFAULT_BATCH_COMPLETION_WINDOW = "24h"
 # Shard batch input JSONL so each file stays under this token budget (tiktoken on ``body.messages``).
-OPENAI_BATCH_MAX_FILE_TOKENS = 1_000_000
+OPENAI_BATCH_MAX_FILE_TOKENS = 1_500_000
 # Token counts for sharding always use this model's tokenizer, regardless of batch ``body.model``.
 BATCH_SHARD_TIKTOKEN_MODEL = "gpt-4o-mini"
 
@@ -807,7 +807,7 @@ class SyntheticDataGenCli:
         batch lines to this file on exact ``custom_id``.
         """
         logger.info(f"{skills_root=}")
-        records = collect_skill_md_without_chinese(skills_root)
+        records = collect_english_skill_md_records(skills_root)
         logger.info(f"collected {len(records)} SKILL.md records")
 
         if max_records is not None:

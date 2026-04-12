@@ -11,12 +11,39 @@ import tiktoken
 import yaml
 from tqdm import tqdm
 
-# Primary Han block (simplified + traditional in common use).
-_HAN_RE = re.compile(r"[\u4e00-\u9fff]")
-# Optional: also match CJK Extension A/B etc. if you need stricter “any CJK ideograph”:
-# _HAN_RE = re.compile(
-#     r"[\u4e00-\u9fff\u3400-\u4dbf\u20000-\u2a6df\u2a700-\u2b73f\u2b740-\u2b81f\u2b820-\u2ceaf]"
-# )
+# Matches any character from a non-Latin Unicode script.
+# Using a blocklist of known non-English scripts is more reliable than an
+# ASCII-ratio heuristic because technical docs legitimately contain many
+# non-letter ASCII characters (code, URLs, punctuation).
+_NON_ENGLISH_SCRIPT_RE = re.compile(
+    "["
+    "\u0400-\u052F"  # Cyrillic + Cyrillic Supplement (Russian, Bulgarian, ...)
+    "\u0590-\u05FF"  # Hebrew
+    "\u0600-\u06FF"  # Arabic
+    "\u0750-\u077F"  # Arabic Supplement
+    "\u0900-\u097F"  # Devanagari (Hindi, Sanskrit)
+    "\u0980-\u09FF"  # Bengali
+    "\u0A00-\u0A7F"  # Gurmukhi (Punjabi)
+    "\u0A80-\u0AFF"  # Gujarati
+    "\u0B00-\u0B7F"  # Odia
+    "\u0B80-\u0BFF"  # Tamil
+    "\u0C00-\u0C7F"  # Telugu
+    "\u0C80-\u0CFF"  # Kannada
+    "\u0D00-\u0D7F"  # Malayalam
+    "\u0E00-\u0E7F"  # Thai
+    "\u0E80-\u0EFF"  # Lao
+    "\u0F00-\u0FFF"  # Tibetan
+    "\u1000-\u109F"  # Myanmar
+    "\u10A0-\u10FF"  # Georgian
+    "\u1100-\u11FF"  # Hangul Jamo (Korean)
+    "\u3040-\u309F"  # Hiragana (Japanese)
+    "\u30A0-\u30FF"  # Katakana (Japanese)
+    "\u3400-\u4DBF"  # CJK Extension A
+    "\u4E00-\u9FFF"  # CJK Unified Ideographs (Chinese / Japanese / Korean)
+    "\uA960-\uA97F"  # Hangul Jamo Extended-A
+    "\uAC00-\uD7AF"  # Hangul Syllables (Korean)
+    "]"
+)
 
 encoding = tiktoken.encoding_for_model("gpt-4o-mini")  # or similar
 
@@ -77,8 +104,8 @@ def decode_skill_md_batch_custom_id(custom_id: str) -> SkillMdBatchCustomIdPaylo
     )
 
 
-def contains_chinese(text: str) -> bool:
-    return _HAN_RE.search(text) is not None
+def contains_non_english_script(text: str) -> bool:
+    return _NON_ENGLISH_SCRIPT_RE.search(text) is not None
 
 
 def scrub_surrogate_codepoints(text: str) -> str:
@@ -221,7 +248,7 @@ def write_skill_md_records_jsonl(
             output_file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def collect_skill_md_without_chinese(root: str | Path) -> list[SkillMdRecord]:
+def collect_english_skill_md_records(root: str | Path) -> list[SkillMdRecord]:
     root_path = Path(root).resolve()
     records: list[SkillMdRecord] = []
 
@@ -233,7 +260,7 @@ def collect_skill_md_without_chinese(root: str | Path) -> list[SkillMdRecord]:
         token_len = len(encoding.encode(raw_text, disallowed_special=set()))
         if token_len > threshold or token_len == 0:
             continue
-        if contains_chinese(raw_text):
+        if contains_non_english_script(raw_text):
             continue
         rel = path.relative_to(root_path).as_posix()
         metadata, body = parse_skill_md_frontmatter(raw_text)
@@ -247,7 +274,7 @@ def collect_skill_md_without_chinese(root: str | Path) -> list[SkillMdRecord]:
 
 if __name__ == "__main__":
     root = "skills/skills"
-    records = collect_skill_md_without_chinese(root)
+    records = collect_english_skill_md_records(root)
     print(f"{root=}")
     print(f"{len(records)=}")
     for r in records[:5]:
