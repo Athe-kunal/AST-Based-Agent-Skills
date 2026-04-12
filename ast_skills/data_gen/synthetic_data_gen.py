@@ -16,10 +16,12 @@ import json
 import random
 import re
 from dataclasses import dataclass, asdict
+from functools import lru_cache
 from pathlib import Path
 
 import fire
 import pydantic
+import tiktoken
 from loguru import logger
 from openai import OpenAI
 
@@ -225,10 +227,16 @@ def openai_batch_chat_completion_request(
 
 DEFAULT_BATCH_ENDPOINT = "/v1/chat/completions"
 DEFAULT_BATCH_COMPLETION_WINDOW = "24h"
-OPENAI_BATCH_MAX_INPUT_FILE_BYTES = 200 * 1024 * 1024
-OPENAI_BATCH_SAFE_INPUT_FILE_BYTES = OPENAI_BATCH_MAX_INPUT_FILE_BYTES - (
-    10 * 1024 * 1024
-)
+# Shard batch input JSONL so each file stays under this token budget (tiktoken on ``body.messages``).
+OPENAI_BATCH_MAX_FILE_TOKENS = 1_000_000
+# Token counts for sharding always use this model's tokenizer, regardless of batch ``body.model``.
+BATCH_SHARD_TIKTOKEN_MODEL = "gpt-4o-mini"
+
+
+@lru_cache(maxsize=1)
+def _tiktoken_encoding_for_batch_sharding() -> tiktoken.Encoding:
+    """Tiktoken encoding for shard budgets: fixed ``gpt-4o-mini`` (not the per-request model)."""
+    return tiktoken.encoding_for_model(BATCH_SHARD_TIKTOKEN_MODEL)
 
 
 def submit_openai_batch_job(
@@ -283,18 +291,35 @@ def build_skill_md_extraction_user_content(skill_md_record: SkillMdRecord) -> st
     )
 
 
-def _jsonl_line_size_bytes(row: dict) -> int:
-    """Return UTF-8 byte size for one JSONL row (including newline)."""
-    return len((json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8"))
+def _batch_chat_messages_token_count(request_row: dict) -> int:
+    """
+    Return tiktoken length for the chat prompt only: ``body.messages`` from the batch row.
+
+    Uses ``BATCH_SHARD_TIKTOKEN_MODEL`` (``gpt-4o-mini``) for counting, independent of
+    ``body.model`` on the request.
+
+    Excludes ``custom_id``, ``method``, ``url``, and other ``body`` keys (``model``,
+    ``max_tokens``, ``response_format``, etc.) so sharding tracks prompt size, not the
+    full JSONL line.
+    """
+    body = request_row.get("body")
+    if not isinstance(body, dict):
+        return 0
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return 0
+    prompt_payload = json.dumps(messages, ensure_ascii=False)
+    encoding = _tiktoken_encoding_for_batch_sharding()
+    return len(encoding.encode(prompt_payload, disallowed_special=set()))
 
 
-def _would_exceed_batch_file_size(
-    current_size_bytes: int,
-    next_line_size_bytes: int,
-    max_file_size_bytes: int,
+def _would_exceed_batch_file_tokens(
+    current_file_tokens: int,
+    next_line_tokens: int,
+    max_file_tokens: int,
 ) -> bool:
-    """Check whether appending a row would exceed the batch input file size limit."""
-    return current_size_bytes + next_line_size_bytes > max_file_size_bytes
+    """Check whether appending a row would exceed the per-file token budget."""
+    return current_file_tokens + next_line_tokens > max_file_tokens
 
 
 def _batch_jsonl_shard_path(base_path: Path, shard_index: int) -> Path:
@@ -314,7 +339,7 @@ def write_openai_batch_skill_md_extraction_jsonl_for_records(
     *,
     model: str = DEFAULT_OPENAI_BATCH_MODEL,
     max_tokens: int = 1024,
-    max_file_size_bytes: int = OPENAI_BATCH_SAFE_INPUT_FILE_BYTES,
+    max_file_tokens: int = OPENAI_BATCH_MAX_FILE_TOKENS,
 ) -> int:
     """
     Emit OpenAI Batch JSONL for SKILL.md extraction, from in-memory records.
@@ -325,13 +350,17 @@ def write_openai_batch_skill_md_extraction_jsonl_for_records(
     ``batches.create(..., metadata={...})`` is separate: job-level tags on the batch
     object, not echoed per completion line.
 
-    If the payload would exceed ``max_file_size_bytes``, additional shards are written
-    as ``{stem}_1{suffix}``, ``{stem}_2{suffix}``, ... beside the primary ``output_path``.
+    If the running token total would exceed ``max_file_tokens`` (tiktoken count on each
+    request's ``body.messages`` only), additional shards are written as ``{stem}_1{suffix}``,
+    ``{stem}_2{suffix}``, ... beside the primary ``output_path``.
+
+    OpenAI still enforces a per-file upload size limit (see Batch API docs); very dense
+    lines could hit that limit before the token cap.
     """
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     written_count = 0
-    current_size_bytes = 0
+    current_file_tokens = 0
     shard_index = 0
     shard_path = _batch_jsonl_shard_path(out_path, shard_index)
     output_file = shard_path.open("w", encoding="utf-8")
@@ -356,17 +385,17 @@ def write_openai_batch_skill_md_extraction_jsonl_for_records(
                 max_tokens=max_tokens,
                 response_format=SKILL_MD_RESPONSE_FORMAT,
             )
-            line_size_bytes = _jsonl_line_size_bytes(request_line)
-            would_exceed = _would_exceed_batch_file_size(
-                current_size_bytes=current_size_bytes,
-                next_line_size_bytes=line_size_bytes,
-                max_file_size_bytes=max_file_size_bytes,
+            line_tokens = _batch_chat_messages_token_count(request_line)
+            would_exceed = _would_exceed_batch_file_tokens(
+                current_file_tokens=current_file_tokens,
+                next_line_tokens=line_tokens,
+                max_file_tokens=max_file_tokens,
             )
             if would_exceed:
-                if current_size_bytes == 0:
+                if current_file_tokens == 0:
                     logger.warning(
-                        "Single batch row exceeds max file size; writing it anyway: "
-                        f"{line_size_bytes=} {max_file_size_bytes=} {shard_path=}"
+                        "Single batch row exceeds max file token budget; writing it anyway: "
+                        f"{line_tokens=} {max_file_tokens=} {shard_path=}"
                     )
                 else:
                     output_file.close()
@@ -374,14 +403,14 @@ def write_openai_batch_skill_md_extraction_jsonl_for_records(
                     shard_path = _batch_jsonl_shard_path(out_path, shard_index)
                     logger.info(
                         "Continuing batch row writes in next shard: "
-                        f"{shard_path=} {current_size_bytes=} {line_size_bytes=} "
-                        f"{max_file_size_bytes=}"
+                        f"{shard_path=} {current_file_tokens=} {line_tokens=} "
+                        f"{max_file_tokens=}"
                     )
                     output_file = shard_path.open("w", encoding="utf-8")
-                    current_size_bytes = 0
+                    current_file_tokens = 0
 
             output_file.write(json.dumps(request_line, ensure_ascii=False) + "\n")
-            current_size_bytes += line_size_bytes
+            current_file_tokens += line_tokens
             written_count += 1
     finally:
         output_file.close()
@@ -390,8 +419,8 @@ def write_openai_batch_skill_md_extraction_jsonl_for_records(
     logger.info(f"{shard_index=}")
     logger.info(f"{len(skill_md_records)=}")
     logger.info(f"{written_count=}")
-    logger.info(f"{current_size_bytes=} (last shard)")
-    logger.info(f"{max_file_size_bytes=}")
+    logger.info(f"{current_file_tokens=} (last shard)")
+    logger.info(f"{max_file_tokens=}")
     return written_count
 
 
@@ -402,7 +431,7 @@ def write_openai_batch_skill_md_extraction_jsonl(
     model: str = DEFAULT_OPENAI_BATCH_MODEL,
     max_records: int | None = None,
     max_tokens: int = 1024,
-    max_file_size_bytes: int = OPENAI_BATCH_SAFE_INPUT_FILE_BYTES,
+    max_file_tokens: int = OPENAI_BATCH_MAX_FILE_TOKENS,
 ) -> int:
     """Emit OpenAI Batch JSONL for SkillMdRecord extraction (read records from JSONL)."""
     skill_md_records = read_skill_md_records_jsonl(records_path)
@@ -415,7 +444,7 @@ def write_openai_batch_skill_md_extraction_jsonl(
         output_path,
         model=model,
         max_tokens=max_tokens,
-        max_file_size_bytes=max_file_size_bytes,
+        max_file_tokens=max_file_tokens,
     )
 
 
@@ -426,13 +455,14 @@ def write_openai_batch_seed_jsonl(
     model: str = DEFAULT_OPENAI_BATCH_MODEL,
     max_skills: int | None = None,
     max_tokens: int = 4096,
-    max_file_size_bytes: int = OPENAI_BATCH_SAFE_INPUT_FILE_BYTES,
+    max_file_tokens: int = OPENAI_BATCH_MAX_FILE_TOKENS,
 ) -> int:
     """
-    Emit a .jsonl file suitable for OpenAI Batch upload (purpose=batch).
+    Emit .jsonl file(s) suitable for OpenAI Batch upload (purpose=batch).
 
     One request per annotation; map results back with custom_id. All lines use
-    the same model (required by Batch API).
+    the same model (required by Batch API). Shards by ``max_file_tokens`` like
+    ``write_openai_batch_skill_md_extraction_jsonl_for_records``.
     """
     annotations: list[dict] = []
     with open(annotations_path, encoding="utf-8") as f:
@@ -445,10 +475,15 @@ def write_openai_batch_seed_jsonl(
     if max_skills is not None:
         annotations = annotations[:max_skills]
 
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     written_count = 0
-    current_size_bytes = 0
+    current_file_tokens = 0
+    shard_index = 0
+    shard_path = _batch_jsonl_shard_path(out_path, shard_index)
+    output_file = shard_path.open("w", encoding="utf-8")
 
-    with open(output_path, "w", encoding="utf-8") as out:
+    try:
         for i, ann in enumerate(annotations):
             custom_id = _sanitize_custom_id(ann["skill_id"], i)
             user_content = build_seed_generation_user_content(ann)
@@ -462,25 +497,40 @@ def write_openai_batch_seed_jsonl(
                 messages=messages,
                 max_tokens=max_tokens,
             )
-            line_size_bytes = _jsonl_line_size_bytes(req)
-            if _would_exceed_batch_file_size(
-                current_size_bytes=current_size_bytes,
-                next_line_size_bytes=line_size_bytes,
-                max_file_size_bytes=max_file_size_bytes,
-            ):
-                logger.info(
-                    "Stopping seed batch row writes at size limit: "
-                    f"{current_size_bytes=} {line_size_bytes=} {max_file_size_bytes=}"
-                )
-                break
+            line_tokens = _batch_chat_messages_token_count(req)
+            would_exceed = _would_exceed_batch_file_tokens(
+                current_file_tokens=current_file_tokens,
+                next_line_tokens=line_tokens,
+                max_file_tokens=max_file_tokens,
+            )
+            if would_exceed:
+                if current_file_tokens == 0:
+                    logger.warning(
+                        "Single seed batch row exceeds max file token budget; writing anyway: "
+                        f"{line_tokens=} {max_file_tokens=} {shard_path=}"
+                    )
+                else:
+                    output_file.close()
+                    shard_index += 1
+                    shard_path = _batch_jsonl_shard_path(out_path, shard_index)
+                    logger.info(
+                        "Continuing seed batch row writes in next shard: "
+                        f"{shard_path=} {current_file_tokens=} {line_tokens=} "
+                        f"{max_file_tokens=}"
+                    )
+                    output_file = shard_path.open("w", encoding="utf-8")
+                    current_file_tokens = 0
 
-            out.write(json.dumps(req, ensure_ascii=False) + "\n")
-            current_size_bytes += line_size_bytes
+            output_file.write(json.dumps(req, ensure_ascii=False) + "\n")
+            current_file_tokens += line_tokens
             written_count += 1
+    finally:
+        output_file.close()
 
     logger.info(f"{written_count=}")
-    logger.info(f"{current_size_bytes=}")
-    logger.info(f"{max_file_size_bytes=}")
+    logger.info(f"{current_file_tokens=} (last shard)")
+    logger.info(f"{shard_index=}")
+    logger.info(f"{max_file_tokens=}")
     return written_count
 
 
@@ -743,7 +793,7 @@ class SyntheticDataGenCli:
         model: str = DEFAULT_OPENAI_BATCH_MODEL,
         max_records: int | None = None,
         max_tokens: int = 1024,
-        max_file_size_bytes: int = OPENAI_BATCH_SAFE_INPUT_FILE_BYTES,
+        max_file_tokens: int = OPENAI_BATCH_MAX_FILE_TOKENS,
     ) -> None:
         """
         Scan SKILL.md under skills_root, save records JSONL, then write OpenAI Batch input JSONL.
@@ -777,7 +827,7 @@ class SyntheticDataGenCli:
             batch_output_path,
             model=model,
             max_tokens=max_tokens,
-            max_file_size_bytes=max_file_size_bytes,
+            max_file_tokens=max_file_tokens,
         )
         logger.info(
             f"Wrote {record_count} batch lines to {batch_output_path} "
@@ -792,7 +842,7 @@ class SyntheticDataGenCli:
         model: str = DEFAULT_OPENAI_BATCH_MODEL,
         max_records: int | None = None,
         max_tokens: int = 4096,
-        max_file_size_bytes: int = OPENAI_BATCH_SAFE_INPUT_FILE_BYTES,
+        max_file_tokens: int = OPENAI_BATCH_MAX_FILE_TOKENS,
     ) -> None:
         """
         Same as extract_skill_md_batch but read pre-built records JSONL instead of scanning.
@@ -824,7 +874,7 @@ class SyntheticDataGenCli:
             batch_output_path,
             model=model,
             max_tokens=max_tokens,
-            max_file_size_bytes=max_file_size_bytes,
+            max_file_tokens=max_file_tokens,
         )
         logger.info(
             f"Wrote {record_count} batch lines to {batch_output_path} "
@@ -838,7 +888,7 @@ class SyntheticDataGenCli:
         model: str = DEFAULT_OPENAI_BATCH_MODEL,
         max_skills: int | None = None,
         max_tokens: int = 4096,
-        max_file_size_bytes: int = OPENAI_BATCH_SAFE_INPUT_FILE_BYTES,
+        max_file_tokens: int = OPENAI_BATCH_MAX_FILE_TOKENS,
     ) -> None:
         """
         Write OpenAI Batch API input JSONL (one chat completion per annotation).
@@ -853,7 +903,7 @@ class SyntheticDataGenCli:
             model=model,
             max_skills=max_skills,
             max_tokens=max_tokens,
-            max_file_size_bytes=max_file_size_bytes,
+            max_file_tokens=max_file_tokens,
         )
         logger.info(f"Wrote {n} batch lines to {batch_output_path} (model={model})")
 
