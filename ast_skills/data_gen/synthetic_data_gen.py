@@ -120,9 +120,9 @@ SKILL_MD_EXTRACTION_SYSTEM_MESSAGE = """You read Agent Skill files (SKILL.md). R
 Ground every statement in the provided SKILL.md. Use all relevant evidence from both narrative sections and implementation sections (for example: commands, scripts, API/tool usage, configuration, inputs/outputs, constraints, caveats, workflow steps, examples, and failure handling).
 
 Writing requirements:
+- `reasoning`: concise justification that maps the extracted `what` and `why` to explicit evidence in the SKILL.md and explains why each seed question is an appropriate retrieval target.
 - `what`: comprehensive capability description. Explain the full scope of what the skill enables, key operations, required inputs, expected outputs, important options, and notable constraints.
 - `why`: comprehensive situational trigger. Explain when to use the skill, the user problems it solves, operational context, trade-offs, and why this workflow is preferred over generic alternatives.
-- `reasoning`: concise justification that maps the extracted `what` and `why` to explicit evidence in the SKILL.md and explains why each seed question is an appropriate retrieval target.
 - `seed_questions`: exactly 5 realistic user tasks that are materially different in intent and wording and together cover the main use-cases implied by the SKILL.md.
 
 Do not invent tools or behaviors that are not present in the SKILL.md. If something is missing, explicitly call out the gap instead of guessing. Before returning, validate that the output is valid JSON and that every required field is present.
@@ -226,8 +226,8 @@ def openai_batch_chat_completion_request(
 DEFAULT_BATCH_ENDPOINT = "/v1/chat/completions"
 DEFAULT_BATCH_COMPLETION_WINDOW = "24h"
 OPENAI_BATCH_MAX_INPUT_FILE_BYTES = 200 * 1024 * 1024
-OPENAI_BATCH_SAFE_INPUT_FILE_BYTES = (
-    OPENAI_BATCH_MAX_INPUT_FILE_BYTES - (10 * 1024 * 1024)
+OPENAI_BATCH_SAFE_INPUT_FILE_BYTES = OPENAI_BATCH_MAX_INPUT_FILE_BYTES - (
+    10 * 1024 * 1024
 )
 
 
@@ -297,6 +297,17 @@ def _would_exceed_batch_file_size(
     return current_size_bytes + next_line_size_bytes > max_file_size_bytes
 
 
+def _batch_jsonl_shard_path(base_path: Path, shard_index: int) -> Path:
+    """
+    Path for the ``shard_index``-th batch JSONL shard.
+
+    ``shard_index`` 0 is ``base_path``; further shards use ``{stem}_{n}{suffix}``.
+    """
+    if shard_index == 0:
+        return base_path
+    return base_path.parent / f"{base_path.stem}_{shard_index}{base_path.suffix}"
+
+
 def write_openai_batch_skill_md_extraction_jsonl_for_records(
     skill_md_records: list[SkillMdRecord],
     output_path: str,
@@ -313,13 +324,19 @@ def write_openai_batch_skill_md_extraction_jsonl_for_records(
 
     ``batches.create(..., metadata={...})`` is separate: job-level tags on the batch
     object, not echoed per completion line.
+
+    If the payload would exceed ``max_file_size_bytes``, additional shards are written
+    as ``{stem}_1{suffix}``, ``{stem}_2{suffix}``, ... beside the primary ``output_path``.
     """
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     written_count = 0
     current_size_bytes = 0
+    shard_index = 0
+    shard_path = _batch_jsonl_shard_path(out_path, shard_index)
+    output_file = shard_path.open("w", encoding="utf-8")
 
-    with out_path.open("w", encoding="utf-8") as output_file:
+    try:
         for index, skill_md_record in enumerate(skill_md_records):
             custom_id = encode_skill_md_record_batch_custom_id(
                 skill_md_record,
@@ -340,25 +357,40 @@ def write_openai_batch_skill_md_extraction_jsonl_for_records(
                 response_format=SKILL_MD_RESPONSE_FORMAT,
             )
             line_size_bytes = _jsonl_line_size_bytes(request_line)
-            if _would_exceed_batch_file_size(
+            would_exceed = _would_exceed_batch_file_size(
                 current_size_bytes=current_size_bytes,
                 next_line_size_bytes=line_size_bytes,
                 max_file_size_bytes=max_file_size_bytes,
-            ):
-                logger.info(
-                    "Stopping batch row writes at size limit: "
-                    f"{current_size_bytes=} {line_size_bytes=} {max_file_size_bytes=}"
-                )
-                break
+            )
+            if would_exceed:
+                if current_size_bytes == 0:
+                    logger.warning(
+                        "Single batch row exceeds max file size; writing it anyway: "
+                        f"{line_size_bytes=} {max_file_size_bytes=} {shard_path=}"
+                    )
+                else:
+                    output_file.close()
+                    shard_index += 1
+                    shard_path = _batch_jsonl_shard_path(out_path, shard_index)
+                    logger.info(
+                        "Continuing batch row writes in next shard: "
+                        f"{shard_path=} {current_size_bytes=} {line_size_bytes=} "
+                        f"{max_file_size_bytes=}"
+                    )
+                    output_file = shard_path.open("w", encoding="utf-8")
+                    current_size_bytes = 0
 
             output_file.write(json.dumps(request_line, ensure_ascii=False) + "\n")
             current_size_bytes += line_size_bytes
             written_count += 1
+    finally:
+        output_file.close()
 
     logger.info(f"{output_path=}")
+    logger.info(f"{shard_index=}")
     logger.info(f"{len(skill_md_records)=}")
     logger.info(f"{written_count=}")
-    logger.info(f"{current_size_bytes=}")
+    logger.info(f"{current_size_bytes=} (last shard)")
     logger.info(f"{max_file_size_bytes=}")
     return written_count
 
