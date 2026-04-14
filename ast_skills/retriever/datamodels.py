@@ -14,7 +14,7 @@ class RetrieverDataModel:
     reasoning: str
     what: str
     why: str
-    seed_questions: str
+    seed_questions: list[str]
     name: str
     description: str
     metadata: dict[str, str]
