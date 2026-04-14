@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pydantic
+
 
 @dataclass(frozen=True)
 class RetrieverDataModel:
@@ -18,3 +20,22 @@ class RetrieverDataModel:
     name: str
     description: str
     metadata: dict[str, str]
+
+
+class SkillMdSummaryExtraction(pydantic.BaseModel):
+    """Structured output for detailed SKILL.md summaries."""
+
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    summary: str
+
+
+class SkillMdExtraction(pydantic.BaseModel):
+    """Structured extraction fields used by retriever dataset generation."""
+
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    reasoning: str
+    what: str
+    why: str
+    seed_questions: list[str]

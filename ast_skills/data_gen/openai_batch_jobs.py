@@ -15,6 +15,7 @@ from openai.types import Batch
 
 
 INPUT_DIR = Path("data")
+SUMMARY_INPUT_DIR = INPUT_DIR / "batch_summary_inputs"
 BATCH_INPUT_DONE_DIR = Path("done")
 OUTPUT_DIR = Path("batch_results")
 ONLINE_OUTPUT_DIR = Path("online_results")
@@ -589,19 +590,22 @@ async def run_online_mode_async(jsonl_files: list[Path]) -> None:
     await client.close()
 
 
-def run(mode: str = DEFAULT_MODE) -> None:
+def run(mode: str = DEFAULT_MODE, input_dir: str = str(INPUT_DIR)) -> None:
     """Runs batch jobs in batch or online mode.
 
     Args:
         mode: Execution mode, either "batch" or "online".
+        input_dir: Directory containing batch JSONL files to execute.
     """
     configure_logging()
     validate_mode(mode=mode)
     logger.info(f"{mode=}")
+    logger.info(f"{input_dir=}")
 
-    jsonl_files = sorted(INPUT_DIR.glob("*.jsonl"))
+    input_path = Path(input_dir)
+    jsonl_files = sorted(input_path.glob("*.jsonl"))
     if not jsonl_files:
-        raise FileNotFoundError(f"No .jsonl files found in {INPUT_DIR}")
+        raise FileNotFoundError(f"No .jsonl files found in {input_path}")
 
     if mode == ONLINE_MODE:
         asyncio.run(run_online_mode_async(jsonl_files=jsonl_files))
@@ -610,9 +614,19 @@ def run(mode: str = DEFAULT_MODE) -> None:
     run_batch_mode(jsonl_files=jsonl_files)
 
 
+def run_summary(mode: str = DEFAULT_MODE) -> None:
+    """Runs only summary input batches from ``data/batch_summary_inputs``."""
+    run(mode=mode, input_dir=str(SUMMARY_INPUT_DIR))
+
+
 def main() -> None:
     """Runs the CLI entrypoint via python-fire."""
-    fire.Fire(run)
+    fire.Fire(
+        {
+            "run": run,
+            "run_summary": run_summary,
+        }
+    )
 
 
 if __name__ == "__main__":
