@@ -55,6 +55,8 @@ class RetrieverDataModel:
     what: str
     why: str
     seed_questions: str
+    name: str
+    description: str
     metadata: dict[str, str]
 
 
@@ -209,9 +211,7 @@ def build_retriever_data_models(
         if load_skill_md_records and record_row is None:
             missing_record += 1
         metadata = (
-            _skill_md_record_metadata_only(record_row)
-            if load_skill_md_records
-            else {}
+            _skill_md_record_metadata_only(record_row) if load_skill_md_records else {}
         )
 
         models.append(
@@ -224,6 +224,8 @@ def build_retriever_data_models(
                 seed_questions=json.dumps(
                     extraction.seed_questions, ensure_ascii=False
                 ),
+                name=metadata.get("name", ""),
+                description=metadata.get("description", ""),
                 metadata=metadata,
             )
         )
