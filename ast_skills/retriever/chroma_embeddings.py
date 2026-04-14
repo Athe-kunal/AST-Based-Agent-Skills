@@ -97,7 +97,9 @@ def _chunked[T](items: list[T], batch_size: int) -> list[list[T]]:
 
 def _build_base_metadata(model: RetrieverDataModel) -> dict[str, Any]:
     """Builds metadata payload stored with each vector."""
-    flattened_metadata = {f"source_{key}": value for key, value in model.metadata.items()}
+    flattened_metadata = {
+        f"source_{key}": value for key, value in model.metadata.items()
+    }
     return {
         "custom_id": model.custom_id,
         "name": model.name,
@@ -177,18 +179,33 @@ def _build_payload(
     )
 
 
-def _write_collection(collection: Collection, payload: _CollectionPayload) -> None:
-    """Writes the field payload to a Chroma collection."""
-    collection.add(
-        ids=payload.ids,
-        documents=payload.documents,
-        embeddings=payload.embeddings,
-        metadatas=payload.metadatas,
-    )
+def _write_collection(
+    collection: Collection,
+    payload: _CollectionPayload,
+    batch_size: int = 5000,
+) -> None:
+    """Writes the field payload to a Chroma collection in batches."""
+    id_batches = _chunked(payload.ids, batch_size)
+    document_batches = _chunked(payload.documents, batch_size)
+    embedding_batches = _chunked(payload.embeddings, batch_size)
+    metadata_batches = _chunked(payload.metadatas, batch_size)
+
+    total = len(payload.ids)
+    log.info(f"{total=}, {batch_size=}, num_batches={len(id_batches)}")
+
+    for batch_index, (ids, documents, embeddings, metadatas) in enumerate(
+        zip(id_batches, document_batches, embedding_batches, metadata_batches)
+    ):
+        collection.add(
+            ids=ids,
+            documents=documents,
+            embeddings=embeddings,
+            metadatas=metadatas,
+        )
+        log.info(f"{batch_index=}, {len(ids)=}")
+
     collection_count = collection.count()
     log.info(f"{collection_count=}")
-
-
 
 
 def _write_bm25_artifact(
@@ -205,13 +222,14 @@ def _write_bm25_artifact(
         output_path=bm25_path,
     )
 
+
 def build_chroma_databases(
     input_jsonl_path: str,
     output_root_dir: str = "artifacts/chroma",
     embedding_base_url: str = "http://127.0.0.1:8000/v1",
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B",
     api_key: str = "EMPTY",
-    embedding_batch_size: int = 64,
+    embedding_batch_size: int = 4096,
 ) -> None:
     """Builds three ChromaDB databases for what/why/description fields."""
     input_jsonl = Path(input_jsonl_path)
@@ -223,7 +241,9 @@ def build_chroma_databases(
 
     rows = _read_jsonl(input_jsonl)
     models = _rows_to_models(rows)
-    embedding_client = _make_embedding_client(base_url=embedding_base_url, api_key=api_key)
+    embedding_client = _make_embedding_client(
+        base_url=embedding_base_url, api_key=api_key
+    )
 
     for field_config in FIELD_CONFIGS:
         field_name = field_config.field_name
@@ -243,7 +263,9 @@ def build_chroma_databases(
             db_path=db_path,
             collection_name=field_config.collection_name,
         )
-        payload = _build_payload(models=models, embeddings=embeddings, field_name=field_name)
+        payload = _build_payload(
+            models=models, embeddings=embeddings, field_name=field_name
+        )
         _write_collection(collection=collection, payload=payload)
         _write_bm25_artifact(
             output_root=output_root,

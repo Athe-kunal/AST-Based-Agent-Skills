@@ -211,3 +211,5 @@ skills/
 *.jsonl
 
 online_results/
+
+artifacts/

@@ -38,25 +38,64 @@ DB_CONFIGS: tuple[_DbConfig, ...] = (
 )
 
 
+_CHROMA_PAGE_SIZE = 500
+
+
+def _fetch_records_paged(
+    collection: Any,
+    page_size: int,
+) -> dict[str, list[Any]]:
+    """Fetches all records from a ChromaDB collection in pages.
+
+    SQLite (used internally by ChromaDB) caps SQL bind variables at 999.
+    Fetching everything in one call exceeds that limit for large collections,
+    so we paginate with ``limit`` / ``offset`` and merge the pages.
+    """
+    total = collection.count()
+    log.info(f"{total=}, {page_size=}")
+
+    merged: dict[str, list[Any]] = {
+        "ids": [],
+        "embeddings": [],
+        "metadatas": [],
+        "documents": [],
+    }
+
+    for offset in range(0, total, page_size):
+        page = collection.get(
+            include=["embeddings", "metadatas", "documents"],
+            limit=page_size,
+            offset=offset,
+        )
+        ids_page = page.get("ids")
+        embeddings_page = page.get("embeddings")
+        metadatas_page = page.get("metadatas")
+        documents_page = page.get("documents")
+
+        merged["ids"].extend(ids_page if ids_page is not None else [])
+        merged["embeddings"].extend(embeddings_page if embeddings_page is not None else [])
+        merged["metadatas"].extend(metadatas_page if metadatas_page is not None else [])
+        merged["documents"].extend(documents_page if documents_page is not None else [])
+        log.info(f"{offset=}, fetched={len(page.get('ids') or [])}")
+
+    return merged
+
+
+@st.cache_data
 def _load_field_frame(root_dir: Path, config: _DbConfig) -> _EmbeddingFrameResult:
     db_path = root_dir / config.db_dir_name
     client = chromadb.PersistentClient(path=str(db_path))
     collection = client.get_collection(name=config.collection_name)
-    records = collection.get(include=["embeddings", "metadatas", "documents"])
+    records = _fetch_records_paged(collection=collection, page_size=_CHROMA_PAGE_SIZE)
 
-    ids = records.get("ids") or []
-    embeddings = records.get("embeddings") or []
-    metadatas = records.get("metadatas") or []
-    documents = records.get("documents") or []
+    ids = records["ids"]
+    embeddings = records["embeddings"]
+    metadatas = records["metadatas"]
 
     frame = pd.DataFrame(
         {
             "id": ids,
-            "text": documents,
             "name": [metadata.get("name", "") for metadata in metadatas],
-            "custom_id": [metadata.get("custom_id", "") for metadata in metadatas],
-            "seed_questions": [metadata.get("seed_questions", "") for metadata in metadatas],
-            "metadata_json": [metadata.get("metadata_json", "") for metadata in metadatas],
             "embedding": embeddings,
         }
     )
@@ -103,14 +142,7 @@ def _plot_clusters(frame: pd.DataFrame, field_name: str) -> None:
         y="y",
         color="cluster",
         hover_name="name",
-        hover_data={
-            "custom_id": True,
-            "seed_questions": True,
-            "text": True,
-            "metadata_json": True,
-            "x": False,
-            "y": False,
-        },
+        hover_data={"x": False, "y": False, "cluster": False},
         title=f"DBSCAN clusters for {field_name}",
         width=1100,
         height=650,

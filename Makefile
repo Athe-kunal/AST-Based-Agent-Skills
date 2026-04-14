@@ -1,6 +1,6 @@
 SERVER ?= 0.0.0.0
 EMBD_PORT ?= 8000
-GPU_DEVICE ?= 0
+GPU_DEVICE ?= 3
 EMBD_MODEL ?= Qwen/Qwen3-Embedding-0.6B
 EMBD_GPU_MEMORY_UTILIZATION ?= 0.85
 EMBD_BASE_URL ?= http://127.0.0.1:$(EMBD_PORT)/v1
@@ -28,6 +28,10 @@ build-retriever-chroma:
 		--embedding_base_url $(EMBD_BASE_URL) \
 		--embedding_model $(EMBD_MODEL) \
 		--api_key $(EMBD_API_KEY)
+
+.PHONY: run-retriever
+run-retriever:
+	nohup $(MAKE) vllm-embd-serve >> retriever.log 2>&1 &
 
 .PHONY: streamlit-clusters
 streamlit-clusters:
