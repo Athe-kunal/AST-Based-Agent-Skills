@@ -19,6 +19,7 @@ from ast_skills.data_gen.skills_data_collect import (
     write_skill_md_records_jsonl,
 )
 
+# GIT_ID = 7a7d8fe3f2eab4ab59c53f0f484e68b6dedb2de4
 DEFAULT_OPENAI_BATCH_MODEL = "gpt-4o-mini"
 
 
@@ -77,7 +78,7 @@ SKILL_MD_RESPONSE_FORMAT = {
 }
 
 
-SKILL_MD_SUMMARY_SYSTEM_MESSAGE = """You read Agent Skill files (SKILL.md). Return exactly one JSON object with one key: summary. No markdown fences, no extra keys, and no commentary outside JSON.
+SKILL_MD_SUMMARY_SYSTEM_MESSAGE = """You read Agent Skill files (SKILL.md). Return exactly one JSON object with keys: summary, seed_questions. No markdown fences, no extra keys, and no commentary outside JSON.
 
 Write a highly descriptive, deeply detailed summary grounded only in the provided SKILL.md. Cover the entire markdown, including:
 - purpose and scope of the skill;
@@ -89,13 +90,15 @@ Write a highly descriptive, deeply detailed summary grounded only in the provide
 - input/output contracts, file paths, data formats, and constraints;
 - operational caveats, limitations, and guardrails.
 
+Also generate `seed_questions`: exactly 5 realistic user tasks that are materially different in intent and wording and together cover the main use-cases implied by the SKILL.md.
+
 Do not invent behavior not present in the markdown. If important information is missing, explicitly state that gap.
 """
 
 
 SKILL_MD_SUMMARY_PROMPT = """You are given the complete markdown source of one SKILL.md file.
 
-Create a very descriptive summary that explains everything in the markdown in practical engineering terms.
+Create a very descriptive summary that explains everything in the markdown in practical engineering terms. Also generate exactly 5 seed questions for the skill.
 
 ----- SKILL.md markdown -----
 {content}
@@ -525,9 +528,9 @@ class SyntheticDataGenCli:
 
     def extract_skill_md_summary_batch(
         self,
-        skills_root: str,
-        batch_output_path: str = "data/batch_summary_inputs/openai_skill_md_summary_batch_input.jsonl",
-        records_jsonl_path: str = "data/batch_summary_inputs/skill_md_records.jsonl",
+        skills_root: str = "skills/skills",
+        batch_output_path: str = "batch_summary_inputs/openai_skill_md_summary_batch_input.jsonl",
+        records_jsonl_path: str = "batch_summary_inputs/skill_md_records.jsonl",
         model: str = DEFAULT_OPENAI_BATCH_MODEL,
         max_records: int | None = None,
         max_tokens: int = 2048,

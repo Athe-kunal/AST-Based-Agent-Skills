@@ -28,6 +28,7 @@ class SkillMdSummaryExtraction(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid")
 
     summary: str
+    seed_questions: list[str]
 
 
 class SkillMdExtraction(pydantic.BaseModel):

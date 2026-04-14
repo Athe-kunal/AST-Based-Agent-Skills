@@ -15,12 +15,13 @@ from openai.types import Batch
 
 
 INPUT_DIR = Path("data")
-SUMMARY_INPUT_DIR = INPUT_DIR / "batch_summary_inputs"
-BATCH_INPUT_DONE_DIR = Path("done")
-OUTPUT_DIR = Path("batch_results")
+SUMMARY_INPUT_DIR = Path("batch_summary_inputs")
+BATCH_INPUT_DONE_DIR = Path("done_summary")
+OUTPUT_DIR = Path("batch_results_summary")
 ONLINE_OUTPUT_DIR = Path("online_results")
 POLL_INTERVAL_SECONDS = 30
 DEFAULT_ONLINE_CONCURRENCY = 32
+DEFAULT_OPENAI_PROJECT = "proj_xzX4LzM7svChhsuEyevHPxm5"
 
 DEFAULT_MODE = "batch"
 ONLINE_MODE = "online"
@@ -31,6 +32,7 @@ class _OnlineConfig(NamedTuple):
 
     api_key: str
     base_url: str | None
+    project: str | None
     model: str
     concurrency: int
 
@@ -79,21 +81,35 @@ def validate_mode(mode: str) -> None:
         raise ValueError(f"Invalid mode: {mode}. Expected one of: {valid_values}")
 
 
-def build_client(api_key: str | None = None, base_url: str | None = None) -> OpenAI:
+def build_client(
+    api_key: str | None = None,
+    base_url: str | None = None,
+    project: str | None = None,
+) -> OpenAI:
     """Builds a synchronous OpenAI client with optional overrides."""
-    if api_key is None and base_url is None:
+    if api_key is None and base_url is None and project is None:
         return OpenAI()
-    return OpenAI(api_key=api_key, base_url=base_url)
+    if project is None:
+        return OpenAI(api_key=api_key, base_url=base_url)
+    return OpenAI(api_key=api_key, base_url=base_url, project=project)
 
 
 def build_async_client(
     api_key: str | None = None,
     base_url: str | None = None,
+    project: str | None = None,
 ) -> AsyncOpenAI:
     """Builds an asynchronous OpenAI client with optional overrides."""
-    if api_key is None and base_url is None:
+    if api_key is None and base_url is None and project is None:
         return AsyncOpenAI()
-    return AsyncOpenAI(api_key=api_key, base_url=base_url)
+    if project is None:
+        return AsyncOpenAI(api_key=api_key, base_url=base_url)
+    return AsyncOpenAI(api_key=api_key, base_url=base_url, project=project)
+
+
+def resolve_openai_project() -> str | None:
+    """Returns the configured OpenAI project ID."""
+    return os.environ.get("OPENAI_PROJECT", DEFAULT_OPENAI_PROJECT)
 
 
 def save_text(path: Path, text: str) -> None:
@@ -325,6 +341,7 @@ def load_online_config() -> _OnlineConfig:
     """Loads required online configuration from environment variables."""
     api_key = os.environ.get("OPENAI_API_KEY")
     base_url = os.environ.get("OPENAI_BASE_URL")
+    project = resolve_openai_project()
     model = os.environ.get("OPENAI_MODEL")
     concurrency_text = os.environ.get("OPENAI_ONLINE_CONCURRENCY")
     concurrency = parse_concurrency(concurrency_text)
@@ -339,9 +356,12 @@ def load_online_config() -> _OnlineConfig:
         missing_text = ", ".join(missing_vars)
         raise ValueError(f"Missing environment variables: {missing_text}")
 
+    assert api_key is not None
+    assert model is not None
     return _OnlineConfig(
         api_key=api_key,
         base_url=base_url,
+        project=project,
         model=model,
         concurrency=concurrency,
     )
@@ -554,7 +574,9 @@ async def process_one_jsonl_online(
 def run_batch_mode(jsonl_files: list[Path]) -> None:
     """Runs all files through the Batch API mode."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    client = build_client()
+    project = resolve_openai_project()
+    logger.info(f"{project=}")
+    client = build_client(project=project)
 
     for path in jsonl_files:
         try:
@@ -568,12 +590,14 @@ async def run_online_mode_async(jsonl_files: list[Path]) -> None:
     ONLINE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     online_config = load_online_config()
     logger.info(f"{online_config.base_url=}")
+    logger.info(f"{online_config.project=}")
     logger.info(f"{online_config.model=}")
     logger.info(f"{online_config.concurrency=}")
 
     client = build_async_client(
         api_key=online_config.api_key,
         base_url=online_config.base_url,
+        project=online_config.project,
     )
 
     for path in jsonl_files:
