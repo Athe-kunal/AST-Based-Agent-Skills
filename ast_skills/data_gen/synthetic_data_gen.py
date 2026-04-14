@@ -1,9 +1,4 @@
-"""
-OpenAI Batch helpers for SKILL.md extraction using ``SkillMdExtraction``.
-
-Builds chat completion batch JSONL so an LLM reads each SKILL.md and returns
-structured fields: reasoning, what, why, and seed_questions.
-"""
+"""OpenAI Batch helpers for SKILL.md extraction and summary generation."""
 
 import json
 from functools import lru_cache
@@ -11,11 +6,11 @@ from pathlib import Path
 from typing import Any
 
 import fire
-import pydantic
 import tiktoken
 from loguru import logger
 from openai import OpenAI
 
+from ast_skills.data_gen.datamodels import SkillMdExtraction, SkillMdSummaryExtraction
 from ast_skills.data_gen.skills_data_collect import (
     SkillMdRecord,
     collect_english_skill_md_records,
@@ -25,15 +20,6 @@ from ast_skills.data_gen.skills_data_collect import (
 )
 
 DEFAULT_OPENAI_BATCH_MODEL = "gpt-4o-mini"
-
-
-class SkillMdExtraction(pydantic.BaseModel):
-    """All fields produced from a single SKILL.md body — nothing else is extracted."""
-
-    reasoning: str
-    what: str
-    why: str
-    seed_questions: list[str]
 
 
 SKILL_MD_EXTRACTION_SYSTEM_MESSAGE = """You read Agent Skill files (SKILL.md). Return exactly one JSON object with keys in this order: reasoning, what, why, seed_questions. No markdown fences, no extra keys, and no commentary outside JSON.
@@ -86,6 +72,42 @@ SKILL_MD_RESPONSE_FORMAT = {
             "required": ["reasoning", "what", "why", "seed_questions"],
             "additionalProperties": False,
         },
+        "strict": True,
+    },
+}
+
+
+SKILL_MD_SUMMARY_SYSTEM_MESSAGE = """You read Agent Skill files (SKILL.md). Return exactly one JSON object with one key: summary. No markdown fences, no extra keys, and no commentary outside JSON.
+
+Write a highly descriptive, deeply detailed summary grounded only in the provided SKILL.md. Cover the entire markdown, including:
+- purpose and scope of the skill;
+- all workflow steps and control flow;
+- required tools, dependencies, and environment assumptions;
+- command-line usage and argument behavior;
+- code snippets and what each snippet does step by step;
+- debugging guidance, troubleshooting instructions, and failure handling;
+- input/output contracts, file paths, data formats, and constraints;
+- operational caveats, limitations, and guardrails.
+
+Do not invent behavior not present in the markdown. If important information is missing, explicitly state that gap.
+"""
+
+
+SKILL_MD_SUMMARY_PROMPT = """You are given the complete markdown source of one SKILL.md file.
+
+Create a very descriptive summary that explains everything in the markdown in practical engineering terms.
+
+----- SKILL.md markdown -----
+{content}
+----- end -----
+"""
+
+
+SKILL_MD_SUMMARY_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "skill_md_summary_response",
+        "schema": SkillMdSummaryExtraction.model_json_schema(),
         "strict": True,
     },
 }
@@ -188,6 +210,11 @@ def build_skill_md_extraction_user_content(skill_md_record: SkillMdRecord) -> st
     return SKILL_MD_EXTRACTION_PROMPT.format(
         content=skill_md_record.content,
     )
+
+
+def build_skill_md_summary_user_content(skill_md_record: SkillMdRecord) -> str:
+    """Build user prompt for generating a detailed SKILL.md summary."""
+    return SKILL_MD_SUMMARY_PROMPT.format(content=skill_md_record.content)
 
 
 def _batch_chat_messages_token_count(request_row: dict) -> int:
@@ -323,6 +350,79 @@ def write_openai_batch_skill_md_extraction_jsonl_for_records(
     return written_count
 
 
+def write_openai_batch_skill_md_summary_jsonl_for_records(
+    skill_md_records: list[SkillMdRecord],
+    output_path: str,
+    *,
+    model: str = DEFAULT_OPENAI_BATCH_MODEL,
+    max_tokens: int = 2048,
+    max_file_tokens: int = OPENAI_BATCH_MAX_FILE_TOKENS,
+) -> int:
+    """Emit OpenAI Batch JSONL for detailed SKILL.md summary generation."""
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    written_count = 0
+    current_file_tokens = 0
+    shard_index = 0
+    shard_path = _batch_jsonl_shard_path(out_path, shard_index)
+    output_file = shard_path.open("w", encoding="utf-8")
+
+    try:
+        for index, skill_md_record in enumerate(skill_md_records):
+            custom_id = encode_skill_md_record_batch_custom_id(skill_md_record, index)
+            messages = [
+                {"role": "system", "content": SKILL_MD_SUMMARY_SYSTEM_MESSAGE},
+                {
+                    "role": "user",
+                    "content": build_skill_md_summary_user_content(skill_md_record),
+                },
+            ]
+            request_line = openai_batch_chat_completion_request(
+                custom_id=custom_id,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                response_format=SKILL_MD_SUMMARY_RESPONSE_FORMAT,
+            )
+            line_tokens = _batch_chat_messages_token_count(request_line)
+            would_exceed = _would_exceed_batch_file_tokens(
+                current_file_tokens=current_file_tokens,
+                next_line_tokens=line_tokens,
+                max_file_tokens=max_file_tokens,
+            )
+            if would_exceed:
+                if current_file_tokens == 0:
+                    logger.warning(
+                        "Single batch row exceeds max file token budget; writing it anyway: "
+                        f"{line_tokens=} {max_file_tokens=} {shard_path=}"
+                    )
+                else:
+                    output_file.close()
+                    shard_index += 1
+                    shard_path = _batch_jsonl_shard_path(out_path, shard_index)
+                    logger.info(
+                        "Continuing batch row writes in next shard: "
+                        f"{shard_path=} {current_file_tokens=} {line_tokens=} "
+                        f"{max_file_tokens=}"
+                    )
+                    output_file = shard_path.open("w", encoding="utf-8")
+                    current_file_tokens = 0
+
+            output_file.write(json.dumps(request_line, ensure_ascii=False) + "\n")
+            current_file_tokens += line_tokens
+            written_count += 1
+    finally:
+        output_file.close()
+
+    logger.info(f"{output_path=}")
+    logger.info(f"{shard_index=}")
+    logger.info(f"{len(skill_md_records)=}")
+    logger.info(f"{written_count=}")
+    logger.info(f"{current_file_tokens=} (last shard)")
+    logger.info(f"{max_file_tokens=}")
+    return written_count
+
+
 def write_openai_batch_skill_md_extraction_jsonl(
     records_path: str,
     output_path: str,
@@ -341,6 +441,30 @@ def write_openai_batch_skill_md_extraction_jsonl(
     return write_openai_batch_skill_md_extraction_jsonl_for_records(
         skill_md_records,
         output_path,
+        model=model,
+        max_tokens=max_tokens,
+        max_file_tokens=max_file_tokens,
+    )
+
+
+def write_openai_batch_skill_md_summary_jsonl(
+    records_path: str,
+    output_path: str,
+    *,
+    model: str = DEFAULT_OPENAI_BATCH_MODEL,
+    max_records: int | None = None,
+    max_tokens: int = 2048,
+    max_file_tokens: int = OPENAI_BATCH_MAX_FILE_TOKENS,
+) -> int:
+    """Emit OpenAI Batch JSONL for detailed SKILL.md summaries from records JSONL."""
+    skill_md_records = read_skill_md_records_jsonl(records_path)
+    logger.info(f"{records_path=}")
+    logger.info(f"{len(skill_md_records)=}")
+    if max_records is not None:
+        skill_md_records = skill_md_records[:max_records]
+    return write_openai_batch_skill_md_summary_jsonl_for_records(
+        skill_md_records=skill_md_records,
+        output_path=output_path,
         model=model,
         max_tokens=max_tokens,
         max_file_tokens=max_file_tokens,
@@ -398,6 +522,43 @@ class SyntheticDataGenCli:
             f"Wrote {record_count} batch lines to {batch_output_path} "
             f"(model={model})"
         )
+
+    def extract_skill_md_summary_batch(
+        self,
+        skills_root: str,
+        batch_output_path: str = "data/batch_summary_inputs/openai_skill_md_summary_batch_input.jsonl",
+        records_jsonl_path: str = "data/batch_summary_inputs/skill_md_records.jsonl",
+        model: str = DEFAULT_OPENAI_BATCH_MODEL,
+        max_records: int | None = None,
+        max_tokens: int = 2048,
+        max_file_tokens: int = OPENAI_BATCH_MAX_FILE_TOKENS,
+    ) -> None:
+        """Build summary batch JSONL files from scanned SKILL.md files."""
+        logger.info(f"{skills_root=}")
+        records = collect_english_skill_md_records(skills_root)
+        logger.info(f"{len(records)=}")
+        if max_records is not None:
+            records = records[:max_records]
+            logger.info(f"{max_records=}")
+            logger.info(f"{len(records)=}")
+
+        if records_jsonl_path:
+            write_skill_md_records_jsonl(
+                records,
+                records_jsonl_path,
+                include_openai_batch_custom_id=True,
+            )
+            logger.info(f"{records_jsonl_path=}")
+
+        record_count = write_openai_batch_skill_md_summary_jsonl_for_records(
+            skill_md_records=records,
+            output_path=batch_output_path,
+            model=model,
+            max_tokens=max_tokens,
+            max_file_tokens=max_file_tokens,
+        )
+        logger.info(f"{record_count=}")
+        logger.info(f"{batch_output_path=}")
 
     def extract_skill_md_batch_from_jsonl(
         self,
@@ -473,6 +634,43 @@ class SyntheticDataGenCli:
             "Poll with the API or dashboard; retrieve output when status is completed. "
             f"{batch_id=}"
         )
+
+    def extract_skill_md_summary_batch_from_jsonl(
+        self,
+        records_path: str,
+        batch_output_path: str = "data/batch_summary_inputs/openai_skill_md_summary_batch_input.jsonl",
+        records_jsonl_path: str = "data/batch_summary_inputs/skill_md_records.jsonl",
+        model: str = DEFAULT_OPENAI_BATCH_MODEL,
+        max_records: int | None = None,
+        max_tokens: int = 2048,
+        max_file_tokens: int = OPENAI_BATCH_MAX_FILE_TOKENS,
+    ) -> None:
+        """Build summary batch JSONL files from an existing records JSONL file."""
+        skill_md_records = read_skill_md_records_jsonl(records_path)
+        logger.info(f"{records_path=}")
+        logger.info(f"{len(skill_md_records)=}")
+        if max_records is not None:
+            skill_md_records = skill_md_records[:max_records]
+            logger.info(f"{max_records=}")
+            logger.info(f"{len(skill_md_records)=}")
+
+        if records_jsonl_path:
+            write_skill_md_records_jsonl(
+                skill_md_records,
+                records_jsonl_path,
+                include_openai_batch_custom_id=True,
+            )
+            logger.info(f"{records_jsonl_path=}")
+
+        record_count = write_openai_batch_skill_md_summary_jsonl_for_records(
+            skill_md_records=skill_md_records,
+            output_path=batch_output_path,
+            model=model,
+            max_tokens=max_tokens,
+            max_file_tokens=max_file_tokens,
+        )
+        logger.info(f"{record_count=}")
+        logger.info(f"{batch_output_path=}")
 
 
 if __name__ == "__main__":
