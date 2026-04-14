@@ -5,8 +5,9 @@ EMBD_MODEL ?= Qwen/Qwen3-Embedding-0.6B
 EMBD_GPU_MEMORY_UTILIZATION ?= 0.85
 EMBD_BASE_URL ?= http://127.0.0.1:$(EMBD_PORT)/v1
 EMBD_API_KEY ?= EMPTY
-RETRIEVER_JSONL ?= artifacts/retriever_models.jsonl
+RETRIEVER_JSONL ?= artifacts/summary_retriever_models.jsonl
 CHROMA_ROOT ?= artifacts/chroma
+ONLY_FIELDS ?= summary
 FIELD ?= description
 TOP_K ?= 10
 QUERY ?= example query
@@ -30,7 +31,8 @@ build-retriever-chroma:
 		--output_root_dir $(CHROMA_ROOT) \
 		--embedding_base_url $(EMBD_BASE_URL) \
 		--embedding_model $(EMBD_MODEL) \
-		--api_key $(EMBD_API_KEY)
+		--api_key $(EMBD_API_KEY) \
+		$(if $(ONLY_FIELDS),--only_fields $(ONLY_FIELDS))
 
 .PHONY: run-retriever
 run-retriever:

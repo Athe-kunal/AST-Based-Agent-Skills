@@ -77,12 +77,11 @@ def read_jsonl_paths(paths: list[str]) -> list[dict[str, Any]]:
     return combined
 
 
-def index_rows_by_custom_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """
-    Map custom_id to row.
+def last_row_by_custom_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Map custom_id to its last row (last-wins for duplicates).
 
-    If the same ``custom_id`` appears more than once, the last row wins (later files / lines
-    override earlier ones).
+    Use for row sets that are logically 1-to-1 per custom_id, such as batch input
+    (done) rows or skill_md_records rows.
     """
     index: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -90,6 +89,22 @@ def index_rows_by_custom_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
         if not isinstance(custom_id, str) or not custom_id:
             continue
         index[custom_id] = row
+    return index
+
+
+def index_rows_by_custom_id(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Group rows by custom_id into lists, preserving insertion order within each group.
+
+    Use for row sets where a custom_id may appear more than once with varying content,
+    such as OpenAI batch output rows where a retry may return a better-formatted response.
+    Callers should iterate the list and pick the first valid result.
+    """
+    index: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        custom_id = row.get("custom_id")
+        if not isinstance(custom_id, str) or not custom_id:
+            continue
+        index.setdefault(custom_id, []).append(row)
     return index
 
 
@@ -133,6 +148,45 @@ def summary_extraction_from_batch_output_row(
         return SkillMdSummaryExtraction.model_validate(parsed_payload)
     except ValidationError:
         return None
+
+
+def first_valid_extraction_from_output_rows(
+    rows: list[dict[str, Any]],
+) -> SkillMdExtraction | None:
+    """Return the first valid ``SkillMdExtraction`` across ``rows``, or None.
+
+    Iterating all rows guards against OpenAI returning a malformed response on one
+    attempt while a valid one exists elsewhere in the list.
+    """
+    for row in rows:
+        extraction = extraction_from_batch_output_row(row)
+        if extraction is not None:
+            return extraction
+        custom_id = row.get("custom_id")
+        log.warning(f"SkillMdExtraction parsing failed for {custom_id=}")
+    if rows:
+        custom_id = rows[0].get("custom_id")
+        log.warning(f"No valid SkillMdExtraction found across all {len(rows)} row(s) for {custom_id=}")
+    return None
+
+
+def first_valid_summary_extraction_from_output_rows(
+    rows: list[dict[str, Any]],
+) -> SkillMdSummaryExtraction | None:
+    """Return the first valid ``SkillMdSummaryExtraction`` across ``rows``, or None.
+
+    Same resilience rationale as ``first_valid_extraction_from_output_rows``.
+    """
+    for row in rows:
+        extraction = summary_extraction_from_batch_output_row(row)
+        if extraction is not None:
+            return extraction
+        custom_id = row.get("custom_id")
+        log.warning(f"SkillMdSummaryExtraction parsing failed for {custom_id=}")
+    if rows:
+        custom_id = rows[0].get("custom_id")
+        log.warning(f"No valid SkillMdSummaryExtraction found across all {len(rows)} row(s) for {custom_id=}")
+    return None
 
 
 def _parsed_batch_output_content(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -214,19 +268,19 @@ def join_batch_jsonl_files(
     output_rows = read_jsonl_paths(output_jsonl)
     log.info(f"{len(input_rows)=}, {len(output_rows)=}")
 
-    input_by_id = index_rows_by_custom_id(input_rows)
+    input_by_id = last_row_by_custom_id(input_rows)
     output_by_id = index_rows_by_custom_id(output_rows)
 
     records_by_id: dict[str, dict[str, Any]] = {}
     if skill_md_records_jsonl:
         record_rows = read_jsonl_paths(skill_md_records_jsonl)
-        records_by_id = index_rows_by_custom_id(record_rows)
+        records_by_id = last_row_by_custom_id(record_rows)
         log.info(f"{len(record_rows)=}, {len(records_by_id)=}")
 
     joined: list[SkillMdBatchRecord] = []
     for custom_id in sorted(input_by_id.keys()):
         input_row = input_by_id[custom_id]
-        output_row = output_by_id.get(custom_id)
+        output_rows = output_by_id.get(custom_id, [])
         record_row = records_by_id.get(custom_id, {})
 
         relative_path, content, metadata = ("", "", _coerce_skill_md_metadata({}))
@@ -234,14 +288,8 @@ def join_batch_jsonl_files(
             relative_path, content, metadata = skill_md_record_row_to_fields(record_row)
 
         prompt = messages_from_batch_input_row(input_row)
-        usage = (
-            usage_from_batch_output_row(output_row) if output_row is not None else None
-        )
-        extraction = (
-            extraction_from_batch_output_row(output_row)
-            if output_row is not None
-            else None
-        )
+        usage = usage_from_batch_output_row(output_rows[-1]) if output_rows else None
+        extraction = first_valid_extraction_from_output_rows(output_rows)
 
         joined.append(
             SkillMdBatchRecord(

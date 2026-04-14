@@ -113,7 +113,7 @@ def _build_base_metadata(model: RetrieverDataModel) -> dict[str, Any]:
     return {
         "custom_id": model.custom_id,
         "name": model.name,
-        "seed_questions": model.seed_questions,
+        "seed_questions_json": json.dumps(model.seed_questions, ensure_ascii=False),
         "metadata_json": json.dumps(model.metadata, ensure_ascii=False, sort_keys=True),
         **flattened_metadata,
     }
@@ -240,14 +240,23 @@ def build_chroma_databases(
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B",
     api_key: str = "EMPTY",
     embedding_batch_size: int = 4096,
+    only_fields: str = "",
 ) -> None:
-    """Builds ChromaDB databases for what/why/summary/description fields."""
+    """Builds ChromaDB databases for what/why/summary/description fields.
+
+    ``only_fields`` is an optional comma-separated list of field names to build
+    (e.g. ``"summary"`` or ``"what,summary"``). When empty, all fields are built.
+    """
     input_jsonl = Path(input_jsonl_path)
     output_root = Path(output_root_dir)
     log.info(
         f"{input_jsonl=}, {output_root=}, {embedding_base_url=}, "
-        f"{embedding_model=}, {embedding_batch_size=}"
+        f"{embedding_model=}, {embedding_batch_size=}, {only_fields=}"
     )
+
+    field_filter = {f.strip() for f in only_fields.split(",") if f.strip()}
+    active_configs = [c for c in FIELD_CONFIGS if not field_filter or c.field_name in field_filter]
+    log.info(f"{field_filter=}, building fields: {[c.field_name for c in active_configs]}")
 
     rows = _read_jsonl(input_jsonl)
     models = _rows_to_models(rows)
@@ -255,7 +264,7 @@ def build_chroma_databases(
         base_url=embedding_base_url, api_key=api_key
     )
 
-    for field_config in FIELD_CONFIGS:
+    for field_config in active_configs:
         field_name = field_config.field_name
         texts = [str(getattr(model, field_name)) for model in models]
         embeddings = _embed_texts(

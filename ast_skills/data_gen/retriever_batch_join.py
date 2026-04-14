@@ -14,12 +14,13 @@ from typing import Any, Final, NamedTuple
 from loguru import logger as log
 
 from ast_skills.data_gen.dataset import (
-    extraction_from_batch_output_row,
+    first_valid_extraction_from_output_rows,
+    first_valid_summary_extraction_from_output_rows,
     index_rows_by_custom_id,
+    last_row_by_custom_id,
     messages_from_batch_input_row,
     read_jsonl,
     skill_md_record_row_to_fields,
-    summary_extraction_from_batch_output_row,
 )
 from ast_skills.data_gen.datamodels import (
     RetrieverDataModel,
@@ -34,7 +35,12 @@ _SKILL_MD_BLOCK_PATTERN: Final[re.Pattern[str]] = re.compile(
 )
 
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parent.parent.parent
-_DEFAULT_SKILL_MD_RECORDS: Final[Path] = _REPO_ROOT / "skill_md_records.jsonl"
+_DEFAULT_SKILL_MD_RECORDS: Final[Path] = _REPO_ROOT / "skill_md_records_1.jsonl"
+_DEFAULT_BATCH_SUMMARY_INPUTS_DIR: Final[Path] = _REPO_ROOT / "batch_summary_inputs"
+
+_SUMMARY_BATCH_OUTPUT_DIR_RE: Final[re.Pattern[str]] = re.compile(
+    r"^openai_skill_md_summary_batch_input_(\d+)$"
+)
 
 
 class RedoBatchExportResult(NamedTuple):
@@ -65,6 +71,49 @@ def _read_jsonl_rows(paths: list[Path]) -> list[dict[str, Any]]:
     for path in paths:
         rows.extend(read_jsonl(path))
     return rows
+
+
+def _max_summary_batch_file_index(batch_results_dir: Path) -> int:
+    """Return the largest ``n`` among child dirs named ``openai_skill_md_summary_batch_input_<n>``."""
+    if not batch_results_dir.is_dir():
+        log.info(f"batch_results_dir missing or not a directory: {batch_results_dir=}")
+        return 0
+    best = 0
+    for child in batch_results_dir.iterdir():
+        if not child.is_dir():
+            continue
+        match = _SUMMARY_BATCH_OUTPUT_DIR_RE.match(child.name)
+        if match:
+            best = max(best, int(match.group(1)))
+    log.info(f"{batch_results_dir=} {best=}")
+    return best
+
+
+def _write_jsonl_row_chunks(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    *,
+    chunk_size: int,
+    start_file_index: int,
+    filename_template: str,
+) -> tuple[list[Path], int]:
+    """Write each row as one JSON line per line in files of at most ``chunk_size`` rows."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    file_index = start_file_index
+    total_written = 0
+    for offset in range(0, len(rows), chunk_size):
+        chunk = rows[offset : offset + chunk_size]
+        name = filename_template.format(index=file_index)
+        out_path = output_dir / name
+        with out_path.open("w", encoding="utf-8") as handle:
+            for row in chunk:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                total_written += 1
+        written.append(out_path)
+        log.info(f"wrote {len(chunk)} rows to {out_path=}")
+        file_index += 1
+    return written, total_written
 
 
 def extract_skill_markdown_from_done_row(row: dict[str, Any]) -> str:
@@ -121,7 +170,7 @@ def _load_skill_md_records_by_custom_id(path: Path) -> dict[str, dict[str, Any]]
         log.warning(f"skill_md_records file missing or not a file: {path=}")
         return {}
     rows = _read_jsonl_dict_rows_lenient(path)
-    by_id = index_rows_by_custom_id(rows)
+    by_id = last_row_by_custom_id(rows)
     log.info(f"{path=}, {len(rows)=}, {len(by_id)=}")
     return by_id
 
@@ -155,7 +204,7 @@ def build_retriever_data_models(
     done_rows = _read_jsonl_rows(done_paths)
     output_rows = _read_jsonl_rows(output_paths)
 
-    done_by_id = index_rows_by_custom_id(done_rows)
+    done_by_id = last_row_by_custom_id(done_rows)
     output_by_id = index_rows_by_custom_id(output_rows)
 
     records_path = (
@@ -179,17 +228,15 @@ def build_retriever_data_models(
     missing_record = 0
     for custom_id in sorted(done_by_id.keys()):
         done_row = done_by_id[custom_id]
-        output_row = output_by_id.get(custom_id)
-        if require_batch_output and output_row is None:
+        output_rows = output_by_id.get(custom_id, [])
+        if require_batch_output and not output_rows:
             missing_output += 1
             continue
 
         markdown_content = extract_skill_markdown_from_done_row(done_row)
-        extraction: SkillMdExtraction | None = None
-        if output_row is not None:
-            extraction = extraction_from_batch_output_row(output_row)
+        extraction = first_valid_extraction_from_output_rows(output_rows)
         if extraction is None:
-            if require_batch_output or output_row is not None:
+            if require_batch_output or output_rows:
                 invalid_extraction += 1
             continue
 
@@ -227,15 +274,27 @@ def build_summary_retriever_data_models(
     require_batch_output: bool = True,
     skill_md_records_path: Path | None = None,
     load_skill_md_records: bool = True,
+    summary_inputs_out_dir: Path | None = None,
+    invalid_summary_chunk_size: int = 500,
+    write_invalid_summary_redo_inputs: bool = True,
+    summary_input_filename_template: str = "openai_skill_md_summary_batch_input_{index}.jsonl",
 ) -> list[SummaryRetrieverDataModel]:
-    """Build summary retriever rows by joining done rows and summary batch outputs."""
+    """Build summary retriever rows by joining done rows and summary batch outputs.
+
+    When ``write_invalid_summary_redo_inputs`` is True, rows with batch output present
+    but failing ``summary_extraction_from_batch_output_row`` are written as original
+    request JSONL under ``summary_inputs_out_dir`` (default: repo ``batch_summary_inputs``),
+    chunked to ``invalid_summary_chunk_size`` lines per file. File indices continue after
+    the highest ``openai_skill_md_summary_batch_input_<n>`` directory name under
+    ``batch_results_dir`` (same layout as ``openai_batch_jobs.process_one_jsonl_batch``).
+    """
     done_paths = _iter_jsonl_files(done_dir)
     output_paths = _iter_jsonl_files_recursive(batch_results_dir)
 
     done_rows = _read_jsonl_rows(done_paths)
     output_rows = _read_jsonl_rows(output_paths)
 
-    done_by_id = index_rows_by_custom_id(done_rows)
+    done_by_id = last_row_by_custom_id(done_rows)
     output_by_id = index_rows_by_custom_id(output_rows)
 
     records_path = (
@@ -253,20 +312,21 @@ def build_summary_retriever_data_models(
     missing_output = 0
     invalid_extraction = 0
     missing_record = 0
+    invalid_summary_redo_rows: list[dict[str, Any]] = []
     for custom_id in sorted(done_by_id.keys()):
         done_row = done_by_id[custom_id]
-        output_row = output_by_id.get(custom_id)
-        if require_batch_output and output_row is None:
+        output_rows = output_by_id.get(custom_id, [])
+        if require_batch_output and not output_rows:
             missing_output += 1
             continue
 
         markdown_content = extract_skill_markdown_from_done_row(done_row)
-        extraction: SkillMdSummaryExtraction | None = None
-        if output_row is not None:
-            extraction = summary_extraction_from_batch_output_row(output_row)
+        extraction = first_valid_summary_extraction_from_output_rows(output_rows)
         if extraction is None:
-            if require_batch_output or output_row is not None:
+            if require_batch_output or output_rows:
                 invalid_extraction += 1
+            if output_rows:
+                invalid_summary_redo_rows.append(done_row)
             continue
 
         record_row = records_by_id.get(custom_id)
@@ -291,12 +351,35 @@ def build_summary_retriever_data_models(
     log.info(
         f"{len(models)=}, {missing_output=}, {invalid_extraction=}, {missing_record=}"
     )
+
+    if write_invalid_summary_redo_inputs and invalid_summary_redo_rows:
+        out_dir = (
+            summary_inputs_out_dir
+            if summary_inputs_out_dir is not None
+            else _DEFAULT_BATCH_SUMMARY_INPUTS_DIR
+        )
+        last_index = _max_summary_batch_file_index(batch_results_dir)
+        start_file_index = last_index + 1
+        log.info(
+            f"writing {len(invalid_summary_redo_rows)} invalid summary redo rows to "
+            f"{out_dir=} starting at {start_file_index=}, "
+            f"{invalid_summary_chunk_size=}, {summary_input_filename_template=}"
+        )
+        written_paths, total_written = _write_jsonl_row_chunks(
+            invalid_summary_redo_rows,
+            out_dir,
+            chunk_size=invalid_summary_chunk_size,
+            start_file_index=start_file_index,
+            filename_template=summary_input_filename_template,
+        )
+        log.info(f"{total_written=}, {written_paths=}")
+
     return models
 
 
 def _redo_input_rows_for_done_and_outputs(
     done_by_id: dict[str, dict[str, Any]],
-    output_by_id: dict[str, dict[str, Any]],
+    output_by_id: dict[str, list[dict[str, Any]]],
 ) -> tuple[list[dict[str, Any]], int, int]:
     """
     Batch input rows from ``done_by_id`` that need re-submission: no matching output,
@@ -309,12 +392,12 @@ def _redo_input_rows_for_done_and_outputs(
     invalid = 0
     for custom_id in sorted(done_by_id.keys()):
         done_row = done_by_id[custom_id]
-        output_row = output_by_id.get(custom_id)
-        if output_row is None:
+        output_rows = output_by_id.get(custom_id, [])
+        if not output_rows:
             missing += 1
             redo_rows.append(done_row)
             continue
-        if extraction_from_batch_output_row(output_row) is None:
+        if first_valid_extraction_from_output_rows(output_rows) is None:
             invalid += 1
             redo_rows.append(done_row)
     return redo_rows, missing, invalid
@@ -343,7 +426,7 @@ def export_redo_batch_inputs(
     done_rows = _read_jsonl_rows(done_paths)
     output_rows = _read_jsonl_rows(output_paths)
 
-    done_by_id = index_rows_by_custom_id(done_rows)
+    done_by_id = last_row_by_custom_id(done_rows)
     output_by_id = index_rows_by_custom_id(output_rows)
 
     redo_rows, missing_count, invalid_count = _redo_input_rows_for_done_and_outputs(
@@ -354,22 +437,13 @@ def export_redo_batch_inputs(
         f"{chunk_size=}, {start_file_index=}"
     )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
-    file_index = start_file_index
-    total_written = 0
-
-    for offset in range(0, len(redo_rows), chunk_size):
-        chunk = redo_rows[offset : offset + chunk_size]
-        name = filename_template.format(index=file_index)
-        out_path = output_dir / name
-        with out_path.open("w", encoding="utf-8") as handle:
-            for row in chunk:
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-                total_written += 1
-        written.append(out_path)
-        log.info(f"wrote {len(chunk)} rows to {out_path=}")
-        file_index += 1
+    written, total_written = _write_jsonl_row_chunks(
+        redo_rows,
+        output_dir,
+        chunk_size=chunk_size,
+        start_file_index=start_file_index,
+        filename_template=filename_template,
+    )
 
     return RedoBatchExportResult(
         written_paths=written,
