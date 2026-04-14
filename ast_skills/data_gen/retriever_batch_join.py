@@ -20,6 +20,7 @@ from ast_skills.data_gen.dataset import (
     read_jsonl,
     skill_md_record_row_to_fields,
 )
+from ast_skills.data_gen.datamodels import RetrieverDataModel
 from ast_skills.data_gen.synthetic_data_gen import SkillMdExtraction
 from ast_skills.retriever.datamodels import RetrieverDataModel
 
