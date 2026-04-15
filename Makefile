@@ -7,8 +7,8 @@ EMBD_BASE_URL ?= http://127.0.0.1:$(EMBD_PORT)/v1
 EMBD_API_KEY ?= EMPTY
 RETRIEVER_JSONL ?= artifacts/summary_retriever_models.jsonl
 CHROMA_ROOT ?= artifacts/chroma
-ONLY_FIELDS ?= summary
-FIELD ?= summary
+ONLY_FIELDS ?= summary,description
+FIELD ?= description
 TOP_K ?= 10
 QUERY ?= I want to read pdf 
 
