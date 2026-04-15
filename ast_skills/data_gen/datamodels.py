@@ -36,6 +36,18 @@ class SummaryRetrieverDataModel:
     metadata: dict[str, str]
 
 
+@dataclass(frozen=True)
+class TrainingData:
+    """One training/evaluation row used by retriever fine-tuning."""
+
+    question: str
+    name: str
+    summary: str
+    description: str
+    in_batch_negatives_descriptions: list[str]
+    in_batch_negatives_summary: list[str]
+
+
 class SkillMdSummaryExtraction(pydantic.BaseModel):
     """Structured output for detailed SKILL.md summaries."""
 
