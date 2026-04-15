@@ -17,12 +17,15 @@ from typing import NamedTuple, Sequence
 
 import fire
 import numpy as np
+import pandas as pd
 import wandb
 import yaml
 from loguru import logger as log
 from openai import OpenAI
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
+from ast_skills.data_gen.datamodels import TrainingData
 from ast_skills.retriever.datamodels import SummaryRetrieverDataModel
 
 
@@ -50,11 +53,33 @@ class _QueryPayload(NamedTuple):
     expected_names: list[str]
 
 
+class _ValidationPayload(NamedTuple):
+    """Loaded validation rows plus query labels."""
+
+    rows: list[TrainingData]
+    query_texts: list[str]
+    expected_names: list[str]
+
+
 class _EncodedCorpus(NamedTuple):
     """Encoded document representation for retrieval."""
 
     sentence_embeddings: np.ndarray | None
     token_embeddings: list[np.ndarray] | None
+
+
+class _ValidationModelConfig(NamedTuple):
+    """Model configuration for validation parquet evaluation."""
+
+    model_key: str
+    model_type: str
+    model_name: str
+
+
+class _ValidationFieldConfig(NamedTuple):
+    """Field configuration for validation parquet evaluation."""
+
+    field_key: str
 
 
 class _EncodedQueries(NamedTuple):
@@ -102,6 +127,80 @@ def _load_rows(dataset_jsonl: str) -> list[SummaryRetrieverDataModel]:
     rows = [SummaryRetrieverDataModel(**row) for row in raw_rows]
     log.info(f"{len(rows)=}")
     return rows
+
+
+VALIDATION_MODEL_CONFIGS: tuple[_ValidationModelConfig, ...] = (
+    _ValidationModelConfig(
+        model_key="bert_large_encoder",
+        model_type="dense",
+        model_name="sentence-transformers/bert-large-nli-mean-tokens",
+    ),
+    _ValidationModelConfig(
+        model_key="qwen3_0_6b",
+        model_type="dense",
+        model_name="Qwen/Qwen3-Embedding-0.6B",
+    ),
+    _ValidationModelConfig(
+        model_key="bm25",
+        model_type="sparse",
+        model_name="bm25",
+    ),
+)
+
+VALIDATION_FIELD_CONFIGS: tuple[_ValidationFieldConfig, ...] = (
+    _ValidationFieldConfig(field_key="summary"),
+    _ValidationFieldConfig(field_key="description"),
+)
+
+
+def _load_validation_payload(validation_parquet: str) -> _ValidationPayload:
+    """Loads ``TrainingData`` rows from validation parquet."""
+    validation_path = Path(validation_parquet)
+    dataframe = pd.read_parquet(validation_path)
+    rows: list[TrainingData] = []
+    for record in dataframe.to_dict(orient="records"):
+        rows.append(TrainingData(**record))
+
+    query_texts = [row.question.strip() for row in rows if row.question.strip()]
+    expected_names = [row.name.strip() for row in rows if row.question.strip()]
+    payload = _ValidationPayload(
+        rows=rows,
+        query_texts=query_texts,
+        expected_names=expected_names,
+    )
+    log.info(f"{validation_path=}, {len(rows)=}, {len(query_texts)=}")
+    return payload
+
+
+def _text_for_field(row: TrainingData, field_key: str) -> str:
+    """Returns text for ``summary`` or ``description`` field retrieval."""
+    if field_key == "summary":
+        return row.summary.strip()
+    if field_key == "description":
+        return row.description.strip()
+    raise ValueError(f"Unsupported field: {field_key}")
+
+
+def _build_validation_corpus(
+    rows: Sequence[TrainingData],
+    field_key: str,
+) -> _CorpusPayload:
+    """Builds unique corpus for one retrieval field."""
+    text_by_name: dict[str, str] = {}
+    for row in rows:
+        name = row.name.strip()
+        if not name or name in text_by_name:
+            continue
+        text = _text_for_field(row=row, field_key=field_key)
+        if not text:
+            continue
+        text_by_name[name] = text
+
+    names = list(text_by_name.keys())
+    texts = [text_by_name[name] for name in names]
+    payload = _CorpusPayload(texts=texts, names=names)
+    log.info(f"{field_key=}, {len(names)=}, {len(texts)=}")
+    return payload
 
 
 def _apply_instruction(text: str, instruction: str) -> str:
@@ -221,6 +320,27 @@ def _score_late_interaction(
                 query_tokens=query_tokens,
                 doc_tokens=doc_tokens,
             )
+    return score_matrix
+
+
+def _tokenize_for_bm25(text: str) -> list[str]:
+    """Tokenizes text for BM25."""
+    return text.casefold().split()
+
+
+def _score_bm25(
+    query_texts: Sequence[str],
+    doc_texts: Sequence[str],
+) -> np.ndarray:
+    """Returns BM25 score matrix for all query-document pairs."""
+    tokenized_docs = [_tokenize_for_bm25(text) for text in doc_texts]
+    bm25 = BM25Okapi(tokenized_docs)
+    score_rows: list[np.ndarray] = []
+    for query_text in query_texts:
+        tokenized_query = _tokenize_for_bm25(query_text)
+        score_rows.append(np.asarray(bm25.get_scores(tokenized_query), dtype=np.float32))
+    score_matrix = np.vstack(score_rows)
+    log.info(f"{score_matrix.shape=}")
     return score_matrix
 
 
@@ -493,9 +613,142 @@ def evaluate_from_config(config_path: str = "configs/train.yaml") -> dict[str, f
     return evaluate(**evaluate_kwargs)
 
 
+def _build_validation_wandb_config(
+    validation_parquet: str,
+    run_name: str,
+) -> dict[str, str | list[str]]:
+    """Builds W&B config for validation parquet evaluation."""
+    config = {
+        "validation_parquet": validation_parquet,
+        "run_name": run_name,
+        "fields": [field.field_key for field in VALIDATION_FIELD_CONFIGS],
+        "models": [model.model_name for model in VALIDATION_MODEL_CONFIGS],
+    }
+    log.info(f"{config=}")
+    return config
+
+
+def _build_validation_payload(
+    metrics_by_field: dict[str, dict[str, RetrievalMetrics]],
+) -> dict[str, float]:
+    """Builds flattened payload for validation evaluation metrics."""
+    payload: dict[str, float] = {}
+    for field_key, metrics_by_model in metrics_by_field.items():
+        for model_key, metrics in metrics_by_model.items():
+            payload[f"eval/{field_key}/{model_key}/queries"] = float(metrics.total_queries)
+            payload[f"eval/{field_key}/{model_key}/hit_at_1"] = metrics.hit_at_1
+            payload[f"eval/{field_key}/{model_key}/hit_at_3"] = metrics.hit_at_3
+            payload[f"eval/{field_key}/{model_key}/hit_at_5"] = metrics.hit_at_5
+            payload[f"eval/{field_key}/{model_key}/mrr"] = metrics.mrr
+    log.info(f"{payload=}")
+    return payload
+
+
+def _build_validation_output(
+    metrics_by_field: dict[str, dict[str, RetrievalMetrics]],
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Builds nested JSON-serializable metrics output."""
+    output: dict[str, dict[str, dict[str, float]]] = {}
+    for field_key, metrics_by_model in metrics_by_field.items():
+        output[field_key] = {}
+        for model_key, metrics in metrics_by_model.items():
+            output[field_key][model_key] = metrics._asdict()
+    log.info(f"{output=}")
+    return output
+
+
+def evaluate_validation_parquet(
+    validation_parquet: str = "Validation.parquet",
+    wandb_project: str = "ast-skills-retriever",
+    wandb_entity: str = "",
+    run_name: str = "validation-parquet-eval",
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Evaluates summary/description retrieval on validation parquet.
+
+    Runs BERT large encoder, Qwen3-0.6B, and BM25 across both retrieval fields.
+    """
+    validation_payload = _load_validation_payload(validation_parquet=validation_parquet)
+    metrics_by_field: dict[str, dict[str, RetrievalMetrics]] = {}
+
+    wandb.init(
+        project=wandb_project,
+        entity=wandb_entity or None,
+        name=run_name,
+        config=_build_validation_wandb_config(
+            validation_parquet=validation_parquet,
+            run_name=run_name,
+        ),
+    )
+
+    for field_config in VALIDATION_FIELD_CONFIGS:
+        field_key = field_config.field_key
+        corpus = _build_validation_corpus(
+            rows=validation_payload.rows,
+            field_key=field_key,
+        )
+        metrics_by_model: dict[str, RetrievalMetrics] = {}
+        for model_config in VALIDATION_MODEL_CONFIGS:
+            log.info(f"{field_key=}, {model_config.model_key=}")
+            if model_config.model_type == "dense":
+                model = SentenceTransformer(model_config.model_name)
+                query_embeddings = _encode_sentence_embeddings(
+                    model=model,
+                    texts=validation_payload.query_texts,
+                )
+                doc_embeddings = _encode_sentence_embeddings(model=model, texts=corpus.texts)
+                score_matrix = _score_bi_encoder(
+                    query_embeddings=query_embeddings,
+                    doc_embeddings=doc_embeddings,
+                )
+            elif model_config.model_type == "sparse":
+                score_matrix = _score_bm25(
+                    query_texts=validation_payload.query_texts,
+                    doc_texts=corpus.texts,
+                )
+            else:
+                raise ValueError(f"Unsupported model type: {model_config.model_type}")
+
+            metrics = _compute_metrics(
+                score_matrix=score_matrix,
+                expected_names=validation_payload.expected_names,
+                corpus_names=corpus.names,
+            )
+            metrics_by_model[model_config.model_key] = metrics
+        metrics_by_field[field_key] = metrics_by_model
+
+    wandb.log(_build_validation_payload(metrics_by_field))
+    table_rows = []
+    for field_key, metrics_by_model in metrics_by_field.items():
+        for model_key, metrics in metrics_by_model.items():
+            table_rows.append(
+                [
+                    field_key,
+                    model_key,
+                    metrics.total_queries,
+                    metrics.hit_at_1,
+                    metrics.hit_at_3,
+                    metrics.hit_at_5,
+                    metrics.mrr,
+                ]
+            )
+    table = wandb.Table(
+        columns=["field", "model", "queries", "hit_at_1", "hit_at_3", "hit_at_5", "mrr"],
+        data=table_rows,
+    )
+    wandb.log({"eval/model_comparison": table})
+    wandb.finish()
+    return _build_validation_output(metrics_by_field)
+
+
 def main() -> None:
     """CLI entrypoint."""
-    fire.Fire({"evaluate": evaluate, "evaluate_from_config": evaluate_from_config})
+    fire.Fire(
+        {
+            "evaluate": evaluate,
+            "evaluate_from_config": evaluate_from_config,
+            "evaluate_validation_parquet": evaluate_validation_parquet,
+        }
+    )
 
 
 if __name__ == "__main__":
