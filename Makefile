@@ -1,13 +1,13 @@
 SERVER ?= 0.0.0.0
 EMBD_PORT ?= 8000
 GPU_DEVICE ?= 3
-EMBD_MODEL ?= Qwen/Qwen3-Embedding-0.6B
-EMBD_GPU_MEMORY_UTILIZATION ?= 0.85
+EMBD_MODEL ?= Qwen/Qwen3-Embedding-8B
+EMBD_GPU_MEMORY_UTILIZATION ?= 0.9
 EMBD_BASE_URL ?= http://127.0.0.1:$(EMBD_PORT)/v1
 EMBD_API_KEY ?= EMPTY
 RETRIEVER_JSONL ?= artifacts/summary_retriever_models.jsonl
 CHROMA_ROOT ?= artifacts/chroma
-ONLY_FIELDS ?= summary,description
+ONLY_FIELDS ?= description
 FIELD ?= description
 TOP_K ?= 10
 QUERY ?= I want to read pdf 

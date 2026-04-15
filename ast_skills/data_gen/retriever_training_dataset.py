@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import fire
+from datasets import Dataset, Features, Sequence, Value
 from loguru import logger as log
 
 from ast_skills.data_gen.datamodels import SummaryRetrieverDataModel, TrainingData
@@ -47,6 +48,45 @@ class _NegativeWindowConfig(NamedTuple):
     negatives_per_row: int
 
 
+_TRAINING_ROW_FEATURES = Features(
+    {
+        "question": Value("string"),
+        "name": Value("string"),
+        "summary": Value("string"),
+        "description": Value("string"),
+        "in_batch_negatives_descriptions": Sequence(Value("string")),
+        "in_batch_negatives_summary": Sequence(Value("string")),
+    }
+)
+
+
+def _normalize_corpus_field_text(text: str) -> str:
+    """Unwraps one layer of JSON string quotes and trims common markdown prefixes.
+
+    Some pipelines store summary/description with surrounding ``"..."`` as literal
+    characters; hybrid retrieval then surfaces those quotes in negatives. A leading
+    ``|`` plus newline often comes from table-style markdown excerpts.
+    """
+    result = text.strip()
+    if not result:
+        return ""
+
+    if len(result) >= 2 and result[0] == '"' and result[-1] == '"':
+        try:
+            decoded = json.loads(result)
+        except json.JSONDecodeError:
+            decoded = None
+        if isinstance(decoded, str):
+            result = decoded.strip()
+        else:
+            result = result[1:-1].strip()
+
+    if result.startswith("|"):
+        result = result[1:].lstrip("\n").lstrip(" \t")
+
+    return result
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     """Reads a JSONL file into dictionaries."""
     rows: list[dict[str, Any]] = []
@@ -63,27 +103,48 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _write_jsonl(path: Path, rows: list[TrainingData]) -> None:
-    """Writes training rows to JSONL."""
+def _write_parquet(path: Path, rows: list[TrainingData]) -> None:
+    """Writes training rows to Parquet via Hugging Face ``datasets``."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row.__dict__, ensure_ascii=False) + "\n")
+    if not rows:
+        dataset = Dataset.from_dict(
+            {
+                "question": [],
+                "name": [],
+                "summary": [],
+                "description": [],
+                "in_batch_negatives_descriptions": [],
+                "in_batch_negatives_summary": [],
+            },
+            features=_TRAINING_ROW_FEATURES,
+        )
+    else:
+        records = [row.__dict__ for row in rows]
+        dataset = Dataset.from_list(records, features=_TRAINING_ROW_FEATURES)
+    dataset.to_parquet(str(path))
     log.info(f"{path=}, {len(rows)=}")
 
 
-def _rows_to_summary_models(rows: list[dict[str, Any]]) -> list[SummaryRetrieverDataModel]:
+def _rows_to_summary_models(
+    rows: list[dict[str, Any]],
+) -> list[SummaryRetrieverDataModel]:
     """Converts dictionaries to ``SummaryRetrieverDataModel`` objects."""
     models: list[SummaryRetrieverDataModel] = []
     for row in rows:
         model = SummaryRetrieverDataModel(
             custom_id=str(row.get("custom_id", "")),
             markdown_content=str(row.get("markdown_content", "")),
-            seed_questions=[str(question) for question in row.get("seed_questions", [])],
-            summary=str(row.get("summary", "")),
+            seed_questions=[
+                _normalize_corpus_field_text(str(question))
+                for question in row.get("seed_questions", [])
+            ],
+            summary=_normalize_corpus_field_text(str(row.get("summary", ""))),
             name=str(row.get("name", "")),
-            description=str(row.get("description", "")),
-            metadata={str(key): str(value) for key, value in dict(row.get("metadata", {})).items()},
+            description=_normalize_corpus_field_text(str(row.get("description", ""))),
+            metadata={
+                str(key): str(value)
+                for key, value in dict(row.get("metadata", {})).items()
+            },
         )
         models.append(model)
     log.info(f"{len(models)=}")
@@ -121,7 +182,9 @@ def _pick_question(seed_questions: list[str], rng: random.Random) -> str:
     return rng.choice(candidates)
 
 
-def _build_negative_lookup(rows: list[SummaryRetrieverDataModel]) -> _NegativeTextLookup:
+def _build_negative_lookup(
+    rows: list[SummaryRetrieverDataModel],
+) -> _NegativeTextLookup:
     """Builds lookup maps from custom_id to summary/description text."""
     summary_by_custom_id: dict[str, str] = {}
     description_by_custom_id: dict[str, str] = {}
@@ -155,9 +218,16 @@ def _slice_hard_negative_window(
     config: _NegativeWindowConfig,
 ) -> list[str]:
     """Returns candidate ids from the configured hard-negative rank window."""
-    filtered_ids = [candidate_id for candidate_id in ordered_ids if candidate_id != positive_custom_id]
+    filtered_ids = [
+        candidate_id
+        for candidate_id in ordered_ids
+        if candidate_id != positive_custom_id
+    ]
 
-    if config.window_start_rank < 1 or config.window_end_rank < config.window_start_rank:
+    if (
+        config.window_start_rank < 1
+        or config.window_end_rank < config.window_start_rank
+    ):
         raise ValueError("Invalid hard-negative rank window.")
 
     start_index = config.window_start_rank - 1
@@ -194,7 +264,9 @@ def _mine_field_negatives(
     rng: random.Random,
 ) -> list[str]:
     """Mines negatives for one field using hybrid retrieval + rank window."""
-    ranked_ids = _hybrid_ranked_ids(question=question, field=field, config=hybrid_config)
+    ranked_ids = _hybrid_ranked_ids(
+        question=question, field=field, config=hybrid_config
+    )
     hard_window_ids = _slice_hard_negative_window(
         ordered_ids=ranked_ids,
         positive_custom_id=positive_custom_id,
@@ -221,14 +293,16 @@ def _build_training_dataset(
     hybrid_config: _HybridSearchConfig,
     window_config: _NegativeWindowConfig,
     seed: int,
+    question_pick_seed: int,
 ) -> list[TrainingData]:
     """Builds ``TrainingData`` rows for one split."""
     lookup = _build_negative_lookup(all_rows)
-    rng = random.Random(seed)
+    question_rng = random.Random(question_pick_seed)
+    negatives_rng = random.Random(seed)
 
     output_rows: list[TrainingData] = []
     for row in rows:
-        question = _pick_question(row.seed_questions, rng)
+        question = _pick_question(row.seed_questions, question_rng)
         if not question:
             log.warning(f"Skipping row with empty question for {row.custom_id=}")
             continue
@@ -240,7 +314,7 @@ def _build_training_dataset(
             field="summary",
             hybrid_config=hybrid_config,
             window_config=window_config,
-            rng=rng,
+            rng=negatives_rng,
         )
         negative_descriptions = _mine_field_negatives(
             question=question,
@@ -249,7 +323,7 @@ def _build_training_dataset(
             field="description",
             hybrid_config=hybrid_config,
             window_config=window_config,
-            rng=rng,
+            rng=negatives_rng,
         )
 
         output_rows.append(
@@ -268,29 +342,32 @@ def _build_training_dataset(
 
 
 def build_training_and_validation_datasets(
-    input_jsonl_path: str,
-    output_train_jsonl_path: str = "artifacts/retriever_training/train.jsonl",
-    output_validation_jsonl_path: str = "artifacts/retriever_training/validation.jsonl",
+    input_jsonl_path: str = "artifacts/summary_retriever_models.jsonl",
+    output_train_parquet_path: str = "artifacts/retriever_training/train.parquet",
+    output_validation_parquet_path: str = "artifacts/retriever_training/validation.parquet",
     validation_ratio: float = 0.1,
     random_seed: int = 13,
+    question_pick_seed: int = 42,
     chroma_root_dir: str = "artifacts/chroma",
     embedding_base_url: str = "http://127.0.0.1:8000/v1",
-    embedding_model: str = "Qwen/Qwen3-Embedding-0.6B",
+    embedding_model: str = "Qwen/Qwen3-Embedding-8B",
     api_key: str = "EMPTY",
     top_k: int = 100,
     rrf_k: int = 60,
     window_start_rank: int = 5,
     window_end_rank: int = 36,
     negatives_per_row: int = 32,
+    smoke_test: bool = False,
 ) -> None:
     """Builds train/validation datasets with hybrid-mined hard negatives.
 
     Args:
       input_jsonl_path: Input JSONL with ``SummaryRetrieverDataModel`` rows.
-      output_train_jsonl_path: Output path for train dataset.
-      output_validation_jsonl_path: Output path for validation dataset.
+      output_train_parquet_path: Output path for train dataset (Parquet).
+      output_validation_parquet_path: Output path for validation dataset (Parquet).
       validation_ratio: Fraction of rows allocated to validation split.
-      random_seed: Global seed for split/question/negative sampling.
+      random_seed: Seed for train/validation split and negative subsampling.
+      question_pick_seed: Seed for randomly choosing one ``seed_question`` per row.
       chroma_root_dir: Root directory containing Chroma and BM25 artifacts.
       embedding_base_url: OpenAI-compatible embedding endpoint.
       embedding_model: Embedding model used for dense query encoding.
@@ -300,14 +377,21 @@ def build_training_and_validation_datasets(
       window_start_rank: First rank (1-indexed) of hard-negative window.
       window_end_rank: Last rank (1-indexed, inclusive) of hard-negative window.
       negatives_per_row: Number of sampled negatives per field.
+      smoke_test: If True, only the first input row is processed for outputs; the
+        full file is still used to resolve retrieved ids to summary/description text.
     """
     input_path = Path(input_jsonl_path)
-    train_path = Path(output_train_jsonl_path)
-    validation_path = Path(output_validation_jsonl_path)
+    train_path = Path(output_train_parquet_path)
+    validation_path = Path(output_validation_parquet_path)
 
     raw_rows = _read_jsonl(input_path)
-    all_rows = _rows_to_summary_models(raw_rows)
-    split = _split_rows(all_rows, validation_ratio=validation_ratio, seed=random_seed)
+    corpus_rows = _rows_to_summary_models(raw_rows)
+    working_rows = corpus_rows[:1] if smoke_test else corpus_rows
+    if smoke_test:
+        log.info(f"{smoke_test=}, {len(working_rows)=}, {len(corpus_rows)=}")
+    split = _split_rows(
+        working_rows, validation_ratio=validation_ratio, seed=random_seed
+    )
 
     hybrid_config = _HybridSearchConfig(
         chroma_root_dir=chroma_root_dir,
@@ -325,21 +409,23 @@ def build_training_and_validation_datasets(
 
     train_rows = _build_training_dataset(
         rows=split.train_rows,
-        all_rows=all_rows,
+        all_rows=corpus_rows,
         hybrid_config=hybrid_config,
         window_config=window_config,
         seed=random_seed,
+        question_pick_seed=question_pick_seed,
     )
     validation_rows = _build_training_dataset(
         rows=split.validation_rows,
-        all_rows=all_rows,
+        all_rows=corpus_rows,
         hybrid_config=hybrid_config,
         window_config=window_config,
         seed=random_seed + 1,
+        question_pick_seed=question_pick_seed,
     )
 
-    _write_jsonl(train_path, train_rows)
-    _write_jsonl(validation_path, validation_rows)
+    _write_parquet(train_path, train_rows)
+    _write_parquet(validation_path, validation_rows)
 
 
 def main() -> None:
