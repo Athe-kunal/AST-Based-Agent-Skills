@@ -336,14 +336,22 @@ def build_summary_retriever_data_models(
             _skill_md_record_metadata_only(record_row) if load_skill_md_records else {}
         )
 
+        name = metadata.get("name", "")
+        description = metadata.get("description", "")
+        if not name or not description:
+            log.warning(
+                f"Skipping record with missing metadata: {custom_id=} {name=} {description=}"
+            )
+            continue
+
         models.append(
             SummaryRetrieverDataModel(
                 custom_id=custom_id,
                 markdown_content=markdown_content,
                 seed_questions=extraction.seed_questions,
                 summary=extraction.summary,
-                name=metadata.get("name", ""),
-                description=metadata.get("description", ""),
+                name=name,
+                description=description,
                 metadata=metadata,
             )
         )
