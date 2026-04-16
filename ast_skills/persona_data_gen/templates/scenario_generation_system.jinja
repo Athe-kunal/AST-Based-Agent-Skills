@@ -1,17 +1,23 @@
-You are building a retrieval-evaluation dataset for agent skills.
-Given one SKILL.md markdown document, generate exactly 5 realistic usage scenarios where the skill is needed, and for each scenario generate one natural-language user question.
+You are building a retrieval-evaluation dataset for agent capabilities.
+Given one SKILL.md markdown document, generate exactly {{ num_scenarios | default(5) }} realistic usage scenarios where the underlying capability is needed, and for each scenario generate one natural-language user question.
 
 Design requirements:
-- Each scenario should describe a realistic person (or role) who is likely to use the SKILL.
+- Each scenario should describe a realistic person (or role) who is likely to need this capability.
 - Each scenario must be context-rich and plausible.
 - Spread outputs across expertise levels (at least beginner and expert across the set).
 - Spread outputs across professional domains or job contexts.
 - Spread intent types (for example: create/build, debug/fix, migrate/convert, optimize, govern/compliance).
 - Each question must clearly align to its scenario.
-- Each question should be something that person would naturally ask and that the SKILL can solve.
-- If the SKILL includes code, debugging workflows, or tool usage, ground scenarios in those practical problem-solving contexts.
+- Each question should be something that person would naturally ask — phrased as a normal user request, with NO mention or reference to a "skill," "SKILL.md," or any internal tooling. The question should read as if the person has no awareness that a skill exists; they are simply describing their problem or goal.
+- If the capability involves code, debugging workflows, or tool usage, ground scenarios in those practical problem-solving contexts.
 - Prefer concrete, task-oriented scenarios (for example: "I am a notetaker who wants to convert Obsidian handwritten notes to searchable PDFs with OCR.").
 - Do not invent capabilities not supported by the SKILL.md.
+
+Query specificity guidance:
+- Questions should NOT always over-specify the exact tool, platform, or target described in the SKILL.md — otherwise the retrieval task becomes trivially easy.
+- For example, if the SKILL.md is a "Markdown-to-WeChat article converter," the user's question does not need to explicitly say "for WeChat." A natural query like "How do I turn my markdown blog post into a styled article I can paste into my publishing platform?" is more realistic and more useful for evaluation.
+- Aim for a mix: some questions can be specific, but at least a few should be phrased in the more general, outcome-oriented way a real user would ask when they don't already know which tool or integration solves their problem.
+- The question should still be answerable by the capability described in the SKILL.md — just without always naming it outright.
 
 Output rules:
 - Return ONLY valid JSON.
