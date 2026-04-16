@@ -274,15 +274,16 @@ def resolve_done_destination(done_dir: Path, filename: str) -> Path:
         counter += 1
 
 
-def move_batch_input_to_done(source: Path) -> None:
-    """Moves a processed batch JSONL input file into the top-level done folder."""
-    BATCH_INPUT_DONE_DIR.mkdir(parents=True, exist_ok=True)
+def move_batch_input_to_done(source: Path, *, done_dir: Path | None = None) -> None:
+    """Moves a processed batch JSONL input file into a done folder (default: ``BATCH_INPUT_DONE_DIR``)."""
+    target_done = done_dir or BATCH_INPUT_DONE_DIR
+    target_done.mkdir(parents=True, exist_ok=True)
     destination = resolve_done_destination(
-        done_dir=BATCH_INPUT_DONE_DIR,
+        done_dir=target_done,
         filename=source.name,
     )
     shutil.move(src=str(source), dst=str(destination))
-    logger.info(f"{source=} {destination=}")
+    logger.info(f"{source=} {destination=} {target_done=}")
 
 
 def save_batch_outputs(client: OpenAI, batch: object, batch_dir: Path) -> None:
@@ -300,9 +301,24 @@ def save_batch_outputs(client: OpenAI, batch: object, batch_dir: Path) -> None:
         logger.info(f"{error_file_id=}")
 
 
-def process_one_jsonl_batch(client: OpenAI, path: Path) -> None:
-    """Processes one input JSONL file through the Batch API."""
-    logger.info(f"{path=}")
+def process_one_jsonl_batch(
+    client: OpenAI,
+    path: Path,
+    *,
+    batch_output_dir: Path | None = None,
+    input_done_dir: Path | None = None,
+) -> None:
+    """Processes one input JSONL file through the Batch API.
+
+    Args:
+        client: OpenAI client (typically with project set for batch uploads).
+        path: Batch input JSONL (``method``, ``url``, ``body``, ``custom_id`` per line).
+        batch_output_dir: Directory under which per-file result folders are created
+            (default: ``OUTPUT_DIR``).
+        input_done_dir: Directory to move the input file into after processing
+            (default: ``BATCH_INPUT_DONE_DIR``).
+    """
+    logger.info(f"{path=} {batch_output_dir=} {input_done_dir=}")
     records = validate_batch_jsonl(path)
     endpoint = resolve_batch_endpoint(records=records, path=path)
 
@@ -320,7 +336,8 @@ def process_one_jsonl_batch(client: OpenAI, path: Path) -> None:
     logger.info(f"{batch_id=}")
 
     batch = wait_for_batch(client=client, batch_id=batch_id)
-    batch_dir = OUTPUT_DIR / path.stem
+    results_root = batch_output_dir or OUTPUT_DIR
+    batch_dir = results_root / path.stem
     batch_dir.mkdir(parents=True, exist_ok=True)
     # batch_summary = build_batch_summary(batch=batch)
     # save_text(
@@ -330,11 +347,11 @@ def process_one_jsonl_batch(client: OpenAI, path: Path) -> None:
 
     if batch.status == "completed":
         save_batch_outputs(client=client, batch=batch, batch_dir=batch_dir)
-        move_batch_input_to_done(source=path)
+        move_batch_input_to_done(source=path, done_dir=input_done_dir)
         return
 
     logger.warning(f"{path=} {batch.status=}")
-    move_batch_input_to_done(source=path)
+    move_batch_input_to_done(source=path, done_dir=input_done_dir)
 
 
 def load_online_config() -> _OnlineConfig:
@@ -571,16 +588,27 @@ async def process_one_jsonl_online(
     )
 
 
-def run_batch_mode(jsonl_files: list[Path]) -> None:
-    """Runs all files through the Batch API mode."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def run_batch_mode(
+    jsonl_files: list[Path],
+    *,
+    batch_output_dir: Path | None = None,
+    input_done_dir: Path | None = None,
+) -> None:
+    """Runs all files through the Batch API mode (sequential: one file, wait, then next)."""
+    results_root = batch_output_dir or OUTPUT_DIR
+    results_root.mkdir(parents=True, exist_ok=True)
     project = resolve_openai_project()
-    logger.info(f"{project=}")
+    logger.info(f"{project=} {results_root=} {input_done_dir=}")
     client = build_client(project=project)
 
     for path in jsonl_files:
         try:
-            process_one_jsonl_batch(client=client, path=path)
+            process_one_jsonl_batch(
+                client=client,
+                path=path,
+                batch_output_dir=batch_output_dir,
+                input_done_dir=input_done_dir,
+            )
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception(f"{path=} {exc=}")
 

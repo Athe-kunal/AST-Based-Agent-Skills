@@ -217,6 +217,11 @@ def _parsed_batch_output_content(row: dict[str, Any]) -> dict[str, Any] | None:
     return parsed
 
 
+def parsed_batch_output_content(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract parsed JSON object from a successful OpenAI batch output JSONL row."""
+    return _parsed_batch_output_content(row)
+
+
 def messages_from_batch_input_row(row: dict[str, Any]) -> list[dict[str, Any]]:
     """Return chat messages from a batch input JSONL row (``body.messages``)."""
     body = row.get("body")

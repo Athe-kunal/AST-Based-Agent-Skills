@@ -131,7 +131,15 @@ persona-driven retrieval evaluation:
 Example usage:
 
 ```bash
-uv run python -m ast_skills.persona_data_gen.prompt_jobs   build_persona_prompts --skills_root skills/skills --output_path outputs/persona_prompts.jsonl
+uv run python -m ast_skills.persona_data_gen.prompt_jobs build_persona_prompts \
+  --skills_root skills/skills --output_dir outputs/persona_batch_inputs
 
-uv run python -m ast_skills.persona_data_gen.prompt_jobs   build_query_prompts --skills_root skills/skills   --persona_jsonl_path outputs/persona_outputs.jsonl   --output_path outputs/query_prompts.jsonl
+uv run python -m ast_skills.persona_data_gen.prompt_jobs build_query_prompts \
+  --skills_root skills/skills \
+  --persona_jsonl_paths '["outputs/persona_batch_results/persona_generation_batch/batch_FILEID_output.jsonl"]' \
+  --output_dir outputs/query_batch_inputs
 ```
+
+Batch input shards are written under ``output_dir`` as numbered files:
+``persona_generation_batch_1.jsonl``, ``persona_generation_batch_2.jsonl``, … and
+``query_generation_batch_1.jsonl``, ``query_generation_batch_2.jsonl``, …
