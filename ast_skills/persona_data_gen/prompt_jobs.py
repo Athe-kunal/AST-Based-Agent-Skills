@@ -10,13 +10,19 @@ from typing import NamedTuple
 import fire
 from loguru import logger
 
+from ast_skills.data_gen.openai_batch_chat_request import (
+    DEFAULT_OPENAI_BATCH_MODEL,
+    openai_batch_chat_completion_request,
+)
 from ast_skills.data_gen.skills_data_collect import (
     SkillMdRecord,
     collect_english_skill_md_records,
 )
 from ast_skills.persona_data_gen.datamodels import (
+    PersonaGeneration,
     PersonaGenerationPromptRow,
     PersonaProfile,
+    PersonaQueryGeneration,
     PersonaQueryPromptRow,
 )
 from ast_skills.persona_data_gen.persona_prompts import (
@@ -27,6 +33,25 @@ from ast_skills.persona_data_gen.query_prompts import (
     QUERY_GENERATION_SYSTEM_PROMPT,
     build_persona_query_prompt,
 )
+
+
+PERSONA_GENERATION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "persona_generation_response",
+        "schema": PersonaGeneration.model_json_schema(),
+        "strict": True,
+    },
+}
+
+QUERY_GENERATION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "persona_query_generation_response",
+        "schema": PersonaQueryGeneration.model_json_schema(),
+        "strict": True,
+    },
+}
 
 
 class _PersonaJsonlRow(NamedTuple):
@@ -71,23 +96,32 @@ def build_persona_generation_prompt_rows(
 def write_persona_generation_prompts_jsonl(
     rows: list[PersonaGenerationPromptRow],
     output_path: str,
+    *,
+    model: str = DEFAULT_OPENAI_BATCH_MODEL,
+    max_tokens: int = 2048,
 ) -> None:
-    """Write persona-generation prompts to JSONL for batch or offline usage."""
+    """Write OpenAI Batch input JSONL (POST /v1/chat/completions) for persona generation."""
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with path.open("w", encoding="utf-8") as output_file:
         for row in rows:
-            payload = {
-                "custom_id": row.custom_id,
-                "relative_path": row.relative_path,
-                "skill_name": row.skill_name,
-                "system_prompt": PERSONA_GENERATION_SYSTEM_PROMPT,
-                "user_prompt": row.prompt,
-            }
-            output_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            messages = [
+                {"role": "system", "content": PERSONA_GENERATION_SYSTEM_PROMPT},
+                {"role": "user", "content": row.prompt},
+            ]
+            request_line = openai_batch_chat_completion_request(
+                custom_id=row.custom_id,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                response_format=PERSONA_GENERATION_RESPONSE_FORMAT,
+            )
+            output_file.write(json.dumps(request_line, ensure_ascii=False) + "\n")
     logger.info(f"{output_path=}")
     logger.info(f"{len(rows)=}")
+    logger.info(f"{model=}")
+    logger.info(f"{max_tokens=}")
 
 
 def _parse_persona_profile(raw_persona: dict) -> PersonaProfile:
@@ -253,54 +287,69 @@ def build_persona_query_prompt_rows(
 def write_persona_query_prompts_jsonl(
     rows: list[PersonaQueryPromptRow],
     output_path: str,
+    *,
+    model: str = DEFAULT_OPENAI_BATCH_MODEL,
+    max_tokens: int = 2048,
 ) -> None:
-    """Write persona-conditioned query prompts to JSONL."""
+    """Write OpenAI Batch input JSONL (POST /v1/chat/completions) for query generation."""
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with path.open("w", encoding="utf-8") as output_file:
         for row in rows:
-            payload = {
-                "custom_id": row.custom_id,
-                "relative_path": row.relative_path,
-                "skill_name": row.skill_name,
-                "persona": {
-                    "role": row.persona.role,
-                    "expertise_level": row.persona.expertise_level,
-                    "domain_context": row.persona.domain_context,
-                    "intent_type": row.persona.intent_type,
-                    "scenario": row.persona.scenario,
-                },
-                "system_prompt": QUERY_GENERATION_SYSTEM_PROMPT,
-                "user_prompt": row.prompt,
-            }
-            output_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            messages = [
+                {"role": "system", "content": QUERY_GENERATION_SYSTEM_PROMPT},
+                {"role": "user", "content": row.prompt},
+            ]
+            request_line = openai_batch_chat_completion_request(
+                custom_id=row.custom_id,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                response_format=QUERY_GENERATION_RESPONSE_FORMAT,
+            )
+            output_file.write(json.dumps(request_line, ensure_ascii=False) + "\n")
 
     logger.info(f"{output_path=}")
     logger.info(f"{len(rows)=}")
+    logger.info(f"{model=}")
+    logger.info(f"{max_tokens=}")
 
 
 class PersonaPromptJobs:
     """CLI jobs for persona and persona-conditioned query prompt generation."""
 
-    def build_persona_prompts(self, skills_root: str, output_path: str) -> None:
-        """Generate JSONL prompts for persona generation from SKILL.md files."""
+    def build_persona_prompts(
+        self,
+        skills_root: str,
+        output_path: str,
+        model: str = DEFAULT_OPENAI_BATCH_MODEL,
+        max_tokens: int = 2048,
+    ) -> None:
+        """Generate OpenAI Batch input JSONL for persona generation from SKILL.md files."""
         skill_md_records = load_filtered_skill_md_records(skills_root)
         rows = build_persona_generation_prompt_rows(skill_md_records)
-        write_persona_generation_prompts_jsonl(rows, output_path)
+        write_persona_generation_prompts_jsonl(
+            rows, output_path, model=model, max_tokens=max_tokens
+        )
 
     def build_query_prompts(
         self,
         skills_root: str,
         persona_jsonl_path: str,
         output_path: str,
+        model: str = DEFAULT_OPENAI_BATCH_MODEL,
+        max_tokens: int = 2048,
     ) -> None:
-        """Generate JSONL prompts for query generation from persona outputs."""
+        """Generate OpenAI Batch input JSONL for query generation from persona outputs."""
         skill_md_records = load_filtered_skill_md_records(skills_root)
         persona_rows = read_persona_generation_output_jsonl(persona_jsonl_path)
         rows = build_persona_query_prompt_rows(skill_md_records, persona_rows)
-        write_persona_query_prompts_jsonl(rows, output_path)
+        write_persona_query_prompts_jsonl(
+            rows, output_path, model=model, max_tokens=max_tokens
+        )
 
 
 if __name__ == "__main__":
     fire.Fire(PersonaPromptJobs)
+ 

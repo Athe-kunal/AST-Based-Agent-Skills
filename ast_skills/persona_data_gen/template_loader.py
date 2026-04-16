@@ -17,7 +17,7 @@ def load_template_text(template_name: str) -> str:
     if not template_path.is_file():
         raise FileNotFoundError(f"Missing template file: {template_path}")
     template_text = template_path.read_text(encoding="utf-8")
-    logger.info(f"{template_path=}")
+    # logger.info(f"{template_path=}")
     return template_text
 
 
@@ -34,5 +34,5 @@ def render_template(template_text: str, variables: dict[str, str]) -> str:
         matched_text = match.group(0)
         replacement = _replace_template_match(match, variables)
         rendered = rendered.replace(matched_text, replacement)
-    logger.info(f"{len(variables)=}")
+    # logger.info(f"{len(variables)=}")
     return rendered

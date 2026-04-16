@@ -11,6 +11,10 @@ from loguru import logger
 from openai import OpenAI
 
 from ast_skills.data_gen.datamodels import SkillMdExtraction, SkillMdSummaryExtraction
+from ast_skills.data_gen.openai_batch_chat_request import (
+    DEFAULT_OPENAI_BATCH_MODEL,
+    openai_batch_chat_completion_request,
+)
 from ast_skills.data_gen.skills_data_collect import (
     SkillMdRecord,
     collect_english_skill_md_records,
@@ -20,7 +24,6 @@ from ast_skills.data_gen.skills_data_collect import (
 )
 
 # GIT_ID = 7a7d8fe3f2eab4ab59c53f0f484e68b6dedb2de4
-DEFAULT_OPENAI_BATCH_MODEL = "gpt-4o-mini"
 
 
 SKILL_MD_EXTRACTION_SYSTEM_MESSAGE = """You read Agent Skill files (SKILL.md). Return exactly one JSON object with keys in this order: reasoning, what, why, seed_questions. No markdown fences, no extra keys, and no commentary outside JSON.
@@ -119,34 +122,6 @@ SKILL_MD_SUMMARY_RESPONSE_FORMAT = {
 # ──────────────────────────────────────────────
 # OPENAI BATCH INPUT
 # ──────────────────────────────────────────────
-
-
-def openai_batch_chat_completion_request(
-    custom_id: str,
-    model: str,
-    messages: list[dict],
-    max_tokens: int,
-    response_format: dict | None = None,
-) -> dict:
-    """
-    One OpenAI Batch API input line for POST /v1/chat/completions.
-
-    See https://developers.openai.com/api/docs/guides/batch
-    """
-    body: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-    }
-    if response_format is not None:
-        body["response_format"] = response_format
-
-    return {
-        "custom_id": custom_id,
-        "method": "POST",
-        "url": "/v1/chat/completions",
-        "body": body,
-    }
 
 
 DEFAULT_BATCH_ENDPOINT = "/v1/chat/completions"

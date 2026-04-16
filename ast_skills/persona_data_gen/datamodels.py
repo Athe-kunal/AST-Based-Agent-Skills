@@ -44,4 +44,12 @@ class PersonaGeneration(pydantic.BaseModel):
 
     model_config = pydantic.ConfigDict(extra="forbid")
 
-    personas: list[str]
+    personas: list[str] = pydantic.Field(min_length=5, max_length=5)
+
+
+class PersonaQueryGeneration(pydantic.BaseModel):
+    """Structured model output for persona-conditioned query generation."""
+
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    query: str
