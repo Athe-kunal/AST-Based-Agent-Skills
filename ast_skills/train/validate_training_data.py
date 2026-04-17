@@ -28,6 +28,7 @@ from ast_skills.persona_data_gen.datamodels import (
     ScenarioRelatedOutput,
 )
 from ast_skills.train.datamodels import ModelOutput, ValidatedTrainingData
+from ast_skills.train.progress_bar import gather_with_progress
 from ast_skills.train.scenario_query_row_io import (
     read_scenario_query_prompt_rows,
     scenario_query_prompt_row_to_json_dict,
@@ -47,10 +48,11 @@ DEFAULT_VALIDATION_MODEL: str = os.environ.get(OPENAI_MODEL_ENV_VAR, "gpt-4o-min
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_MAX_CONCURRENCY = 128
 DEFAULT_INPUT_PATH = "artifacts/scenario_query_prompt_row_data_models.jsonl"
-DEFAULT_OUTPUT_PATH = "artifacts/validated_training_data.jsonl"
+DEFAULT_OUTPUT_PATH = "artifacts/validated_training_data_1.jsonl"
 DEFAULT_SMOKE_NUM_SAMPLES = 2
 DEFAULT_SMOKE_INPUT_PATH = "artifacts/smoke_input.jsonl"
 DEFAULT_SMOKE_OUTPUT_PATH = "artifacts/smoke_output.jsonl"
+DEFAULT_PROGRESS_FILE = "artifacts/validation_progress.json"
 
 VALIDATION_SYSTEM_PROMPT = """You are a quality reviewer for an AI skill knowledge base.
 
@@ -260,6 +262,7 @@ async def validate_all_rows(
     model: str,
     max_tokens: int,
     max_concurrency: int,
+    progress_file: str | None = None,
 ) -> list[tuple[ScenarioQueryPromptRowDataModel, ModelOutput | None]]:
     """Run LLM validation for all rows concurrently, bounded by max_concurrency."""
     semaphore = asyncio.Semaphore(max_concurrency)
@@ -267,7 +270,7 @@ async def validate_all_rows(
         _validate_row_with_semaphore(semaphore, client, row, model, max_tokens)
         for row in rows
     ]
-    return await asyncio.gather(*tasks)
+    return await gather_with_progress(tasks, desc="Validating rows", progress_file=progress_file)
 
 
 # ──────────────────────────────────────────────
@@ -315,6 +318,21 @@ def write_validated_training_data_jsonl(
         for row in rows:
             handle.write(json.dumps(asdict(row), ensure_ascii=False) + "\n")
     log.info(f"{path=} {len(rows)=}")
+
+
+def read_validated_training_data_jsonl(path: str) -> list[ValidatedTrainingData]:
+    """Read ValidatedTrainingData rows from an existing JSONL output file."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    rows: list[ValidatedTrainingData] = []
+    with p.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                rows.append(ValidatedTrainingData(**json.loads(line)))
+    log.info(f"Loaded {len(rows)=} existing validated rows from {path=}")
+    return rows
 
 
 def sample_rows(
@@ -374,28 +392,54 @@ async def run_validation_pipeline(
     model: str,
     max_tokens: int,
     max_concurrency: int,
+    load_from_output_cache_file: bool = False,
+    progress_file: str | None = DEFAULT_PROGRESS_FILE,
 ) -> None:
-    """Load rows, validate with LLM, and write results to JSONL."""
-    rows = read_scenario_query_prompt_rows(input_path)
-    log.info(f"{input_path=} {len(rows)=}")
+    """Load rows, validate with LLM, and write results to JSONL.
+
+    When ``load_from_output_cache_file`` is True, reads the existing output
+    file, skips custom_ids that are already validated, and only re-runs the
+    pipeline for the remaining rows. The merged result is written back to
+    ``output_path``. At the end, logs how many rows are still unvalidated.
+    """
+    all_input_rows = read_scenario_query_prompt_rows(input_path)
+    log.info(f"{input_path=} total {len(all_input_rows)=}")
+
+    existing_validated: list[ValidatedTrainingData] = []
+    if load_from_output_cache_file:
+        existing_validated = read_validated_training_data_jsonl(output_path)
+        already_done_ids = {row.custom_id for row in existing_validated}
+        rows = [r for r in all_input_rows if r.custom_id not in already_done_ids]
+        log.info(
+            f"Cache mode: {len(existing_validated)=} already done, {len(rows)=} to re-run"
+        )
+    else:
+        rows = all_input_rows
 
     client = _build_async_openai_client()
-    results = await validate_all_rows(rows, client, model, max_tokens, max_concurrency)
+    results = await validate_all_rows(rows, client, model, max_tokens, max_concurrency, progress_file=progress_file)
 
-    validated: list[ValidatedTrainingData] = []
+    newly_validated: list[ValidatedTrainingData] = []
     failed_ids: list[str] = []
     for row, model_output in results:
         if model_output is None:
             log.warning(f"Skipping failed row: {row.custom_id=}")
             failed_ids.append(row.custom_id)
             continue
-        validated.append(build_validated_training_data(row, model_output))
+        newly_validated.append(build_validated_training_data(row, model_output))
 
-    log.info(f"{len(validated)=} {len(failed_ids)=}")
+    log.info(f"{len(newly_validated)=} {len(failed_ids)=}")
     if failed_ids:
         log.warning(f"{failed_ids=}")
 
-    write_validated_training_data_jsonl(validated, output_path)
+    combined = existing_validated + newly_validated
+    validated_ids = {r.custom_id for r in combined}
+    still_left = [r for r in all_input_rows if r.custom_id not in validated_ids]
+    log.info(f"Still left to validate: {len(still_left)}")
+    if still_left:
+        log.warning(f"still_left_ids={[r.custom_id for r in still_left]}")
+
+    write_validated_training_data_jsonl(combined, output_path)
 
 
 # ──────────────────────────────────────────────
@@ -413,6 +457,7 @@ class ValidationPipelineCli:
         model: str = DEFAULT_VALIDATION_MODEL,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+        load_from_output_cache_file: bool = True,
     ) -> None:
         """Validate ScenarioQueryPromptRowDataModel rows and write validated JSONL.
 
@@ -420,16 +465,22 @@ class ValidationPipelineCli:
         ``max_concurrency`` in-flight at once), and writes results to ``output_path``.
         Rows that fail LLM validation are skipped with a warning log.
 
+        When ``load_from_output_cache_file`` is True, loads the existing
+        ``output_path`` file, skips already-validated custom_ids, re-runs only
+        the failing rows, merges results, and logs how many rows are still left.
+
         Example::
 
             uv run python ast_skills/train/validate_training_data.py run \\
                 --input_path artifacts/scenario_query_prompt_row_data_models.jsonl \\
                 --output_path artifacts/validated_training_data.jsonl \\
                 --model gpt-4o \\
-                --max_concurrency 20
+                --max_concurrency 20 \\
+                --load_from_output_cache_file true
         """
         log.info(
-            f"{input_path=} {output_path=} {model=} {max_tokens=} {max_concurrency=}"
+            f"{input_path=} {output_path=} {model=} {max_tokens=} "
+            f"{max_concurrency=} {load_from_output_cache_file=}"
         )
         asyncio.run(
             run_validation_pipeline(
@@ -438,6 +489,7 @@ class ValidationPipelineCli:
                 model=model,
                 max_tokens=max_tokens,
                 max_concurrency=max_concurrency,
+                load_from_output_cache_file=load_from_output_cache_file,
             )
         )
 
