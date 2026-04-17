@@ -1,0 +1,537 @@
+"""Async validation pipeline for ScenarioQueryPromptRowDataModel rows.
+
+Steps per row:
+  1. Ask an LLM (async OpenAI) to validate/complete the summary and pick 5
+     relevant questions from the combined seed_questions + scenario questions.
+  2. Attribute each filtered question to its source pool (seed vs scenario)
+     via Levenshtein distance to the nearest original candidate.
+  3. Write ValidatedTrainingData rows to a JSONL file.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import random
+from dataclasses import asdict
+from pathlib import Path
+from typing import NamedTuple
+
+import fire
+import pydantic
+from loguru import logger as log
+from openai import AsyncOpenAI
+
+from ast_skills.persona_data_gen.datamodels import (
+    ScenarioQueryPromptRowDataModel,
+    ScenarioRelatedOutput,
+)
+from ast_skills.train.datamodels import ModelOutput, ValidatedTrainingData
+from ast_skills.train.progress_bar import gather_with_progress
+from ast_skills.train.scenario_query_row_io import (
+    read_scenario_query_prompt_rows,
+    scenario_query_prompt_row_to_json_dict,
+)
+
+
+# ──────────────────────────────────────────────
+# CONSTANTS
+# ──────────────────────────────────────────────
+
+OPENAI_API_KEY_ENV_VAR = "OPENAI_API_KEY"
+OPENAI_BASE_URL_ENV_VAR = "OPENAI_BASE_URL"
+OPENAI_MODEL_ENV_VAR = "OPENAI_MODEL"
+
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_VALIDATION_MODEL: str = os.environ.get(OPENAI_MODEL_ENV_VAR, "gpt-4o-mini")
+DEFAULT_MAX_TOKENS = 2048
+DEFAULT_MAX_CONCURRENCY = 128
+DEFAULT_INPUT_PATH = "artifacts/scenario_query_prompt_row_data_models.jsonl"
+DEFAULT_OUTPUT_PATH = "artifacts/validated_training_data_1.jsonl"
+DEFAULT_SMOKE_NUM_SAMPLES = 2
+DEFAULT_SMOKE_INPUT_PATH = "artifacts/smoke_input.jsonl"
+DEFAULT_SMOKE_OUTPUT_PATH = "artifacts/smoke_output.jsonl"
+DEFAULT_PROGRESS_FILE = "artifacts/validation_progress.json"
+
+VALIDATION_SYSTEM_PROMPT = """You are a quality reviewer for an AI skill knowledge base.
+
+Given a SKILL.md markdown document and a list of candidate questions, select
+exactly 5 questions that are MOST relevant to the skill. Preserve the exact
+wording of each chosen question — do NOT rephrase or invent new questions.
+
+A good question is one where a practitioner reading the SKILL.md file could
+directly answer it. It should be specific to what the skill actually does —
+not a vague meta-question like "What does this skill do?" or "How does this
+skill work?", but a concrete question about a real task or workflow that this
+skill enables.
+
+Return a JSON object with:
+  - reasoning: explain why you picked each of the 5 questions.
+  - filtered_questions: exactly 5 questions copied verbatim from the candidates.
+"""
+
+VALIDATION_USER_PROMPT_TEMPLATE = """\
+----- SKILL.md CONTENT -----
+{markdown_content}
+----- END CONTENT -----
+
+Candidate questions:
+{questions_formatted}
+
+Select exactly 5 questions from the candidates above that best represent the
+range of use-cases for this skill. Copy each question verbatim.
+"""
+
+VALIDATION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "validation_response",
+        "schema": ModelOutput.model_json_schema(),
+        "strict": True,
+    },
+}
+
+
+# ──────────────────────────────────────────────
+# QUESTION SOURCE ATTRIBUTION
+# ──────────────────────────────────────────────
+
+
+class ClosestMatch(NamedTuple):
+    """Nearest-candidate lookup result for a single filtered question."""
+
+    candidate: str
+    source: str  # "seed" or "scenario"
+    distance: int
+
+
+def _levenshtein_distance(a: str, b: str) -> int:
+    """Compute the Levenshtein edit distance between two strings."""
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            if a[i - 1] == b[j - 1]:
+                dp[j] = prev
+            else:
+                dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+    return dp[n]
+
+
+def _find_closest_match(
+    question: str,
+    seed_questions: list[str],
+    scenario_questions: list[str],
+) -> ClosestMatch:
+    """Return the nearest original candidate and its source pool.
+
+    Searches both pools using case-folded Levenshtein distance. Ties break
+    in favor of ``seed`` since seed candidates are checked first.
+    """
+    best: ClosestMatch | None = None
+    for candidate in seed_questions:
+        dist = _levenshtein_distance(question.lower(), candidate.lower())
+        if best is None or dist < best.distance:
+            best = ClosestMatch(candidate=candidate, source="seed", distance=dist)
+    for candidate in scenario_questions:
+        dist = _levenshtein_distance(question.lower(), candidate.lower())
+        if best is None or dist < best.distance:
+            best = ClosestMatch(candidate=candidate, source="scenario", distance=dist)
+    if best is None:
+        return ClosestMatch(candidate=question, source="seed", distance=0)
+    return best
+
+
+def _count_questions_by_source(
+    filtered_questions: list[str],
+    seed_questions: list[str],
+    scenario_questions: list[str],
+) -> tuple[int, int]:
+    """Return ``(num_from_seed, num_from_scenario)`` for the filtered question list."""
+    num_seed = 0
+    num_scenario = 0
+    for question in filtered_questions:
+        match = _find_closest_match(question, seed_questions, scenario_questions)
+        log.info(
+            f"{question=} matched {match.candidate=} "
+            f"source={match.source} distance={match.distance}"
+        )
+        if match.source == "seed":
+            num_seed += 1
+        else:
+            num_scenario += 1
+    return num_seed, num_scenario
+
+
+# ──────────────────────────────────────────────
+# PROMPT BUILDING
+# ──────────────────────────────────────────────
+
+
+def _extract_scenario_questions(
+    scenario_output: list[ScenarioRelatedOutput],
+) -> list[str]:
+    """Extract just the question string from each ScenarioRelatedOutput."""
+    return [item.question for item in scenario_output]
+
+
+def _format_numbered_list(items: list[str]) -> str:
+    """Format a list of strings as a 1-indexed numbered list for a prompt."""
+    return "\n".join(f"  {i + 1}. {item}" for i, item in enumerate(items))
+
+
+def build_validation_user_prompt(row: ScenarioQueryPromptRowDataModel) -> str:
+    """Render the user-turn prompt for one ScenarioQueryPromptRowDataModel row."""
+    scenario_questions = _extract_scenario_questions(row.scenario_output)
+    all_questions = random.sample(
+        row.seed_questions + scenario_questions,
+        len(row.seed_questions) + len(scenario_questions),
+    )
+    return VALIDATION_USER_PROMPT_TEMPLATE.format(
+        markdown_content=row.markdown_content,
+        questions_formatted=_format_numbered_list(all_questions),
+    )
+
+
+def build_validation_messages(
+    row: ScenarioQueryPromptRowDataModel,
+) -> list[dict[str, str]]:
+    """Return the full messages list for the OpenAI chat completion call."""
+    return [
+        {"role": "system", "content": VALIDATION_SYSTEM_PROMPT},
+        {"role": "user", "content": build_validation_user_prompt(row)},
+    ]
+
+
+# ──────────────────────────────────────────────
+# OPENAI ASYNC CALL
+# ──────────────────────────────────────────────
+
+
+async def call_openai_validation(
+    client: AsyncOpenAI,
+    row: ScenarioQueryPromptRowDataModel,
+    model: str,
+    max_tokens: int,
+) -> ModelOutput | None:
+    """Call OpenAI and parse the structured response as ModelOutput.
+
+    Returns ``None`` on network errors or validation failures so the caller
+    can skip or retry the row without crashing the pipeline.
+    """
+    messages = build_validation_messages(row)
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            response_format=VALIDATION_RESPONSE_FORMAT,
+        )
+        raw_content = response.choices[0].message.content
+        parsed = json.loads(raw_content)
+        return ModelOutput.model_validate(parsed)
+    except pydantic.ValidationError as exc:
+        log.warning(f"ModelOutput validation failed: {row.custom_id=} {exc=}")
+        return None
+    except Exception as exc:  # pylint: disable=broad-except
+        log.warning(f"OpenAI call failed: {row.custom_id=} {exc=}")
+        return None
+
+
+async def _validate_row_with_semaphore(
+    semaphore: asyncio.Semaphore,
+    client: AsyncOpenAI,
+    row: ScenarioQueryPromptRowDataModel,
+    model: str,
+    max_tokens: int,
+) -> tuple[ScenarioQueryPromptRowDataModel, ModelOutput | None]:
+    """Acquire semaphore, run LLM validation, and return the (row, output) pair."""
+    async with semaphore:
+        log.info(f"Validating: {row.custom_id=} {row.name=}")
+        output = await call_openai_validation(client, row, model, max_tokens)
+        return row, output
+
+
+async def validate_all_rows(
+    rows: list[ScenarioQueryPromptRowDataModel],
+    client: AsyncOpenAI,
+    model: str,
+    max_tokens: int,
+    max_concurrency: int,
+    progress_file: str | None = None,
+) -> list[tuple[ScenarioQueryPromptRowDataModel, ModelOutput | None]]:
+    """Run LLM validation for all rows concurrently, bounded by max_concurrency."""
+    semaphore = asyncio.Semaphore(max_concurrency)
+    tasks = [
+        _validate_row_with_semaphore(semaphore, client, row, model, max_tokens)
+        for row in rows
+    ]
+    return await gather_with_progress(tasks, desc="Validating rows", progress_file=progress_file)
+
+
+# ──────────────────────────────────────────────
+# BUILDING ValidatedTrainingData
+# ──────────────────────────────────────────────
+
+
+def build_validated_training_data(
+    row: ScenarioQueryPromptRowDataModel,
+    model_output: ModelOutput,
+) -> ValidatedTrainingData:
+    """Combine a source row and LLM output into a ValidatedTrainingData record."""
+    scenario_questions = _extract_scenario_questions(row.scenario_output)
+    num_seed, num_scenario = _count_questions_by_source(
+        model_output.filtered_questions,
+        row.seed_questions,
+        scenario_questions,
+    )
+    log.info(f"{row.custom_id=} {num_seed=} {num_scenario=}")
+    return ValidatedTrainingData(
+        custom_id=row.custom_id,
+        name=row.name,
+        markdown_content=row.markdown_content,
+        description=row.description,
+        reasoning=model_output.reasoning,
+        filtered_questions=model_output.filtered_questions,
+        num_from_seed_questions=str(num_seed),
+        num_from_scenario_questions=str(num_scenario),
+    )
+
+
+# ──────────────────────────────────────────────
+# JSONL I/O
+# ──────────────────────────────────────────────
+
+
+def write_validated_training_data_jsonl(
+    rows: list[ValidatedTrainingData],
+    path: str,
+) -> None:
+    """Write ValidatedTrainingData rows to a JSONL file, one JSON object per line."""
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(asdict(row), ensure_ascii=False) + "\n")
+    log.info(f"{path=} {len(rows)=}")
+
+
+def read_validated_training_data_jsonl(path: str) -> list[ValidatedTrainingData]:
+    """Read ValidatedTrainingData rows from an existing JSONL output file."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    rows: list[ValidatedTrainingData] = []
+    with p.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                rows.append(ValidatedTrainingData(**json.loads(line)))
+    log.info(f"Loaded {len(rows)=} existing validated rows from {path=}")
+    return rows
+
+
+def sample_rows(
+    rows: list[ScenarioQueryPromptRowDataModel],
+    num_samples: int,
+) -> list[ScenarioQueryPromptRowDataModel]:
+    """Return a random sample of ``num_samples`` rows without replacement."""
+    count = min(num_samples, len(rows))
+    sampled = random.sample(rows, count)
+    log.info(f"Sampled {count} of {len(rows)} rows: {[r.custom_id for r in sampled]}")
+    return sampled
+
+
+def write_sampled_rows_jsonl(
+    rows: list[ScenarioQueryPromptRowDataModel],
+    path: str,
+) -> None:
+    """Write sampled ScenarioQueryPromptRowDataModel rows to a JSONL file."""
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(
+                json.dumps(
+                    scenario_query_prompt_row_to_json_dict(row), ensure_ascii=False
+                )
+                + "\n"
+            )
+    log.info(f"{path=} {len(rows)=}")
+
+
+# ──────────────────────────────────────────────
+# CLIENT CONSTRUCTION
+# ──────────────────────────────────────────────
+
+
+def _build_async_openai_client() -> AsyncOpenAI:
+    """Build AsyncOpenAI from environment variables.
+
+    Reads ``OPENAI_API_KEY`` and ``OPENAI_BASE_URL`` as plain strings.
+    ``OPENAI_BASE_URL`` falls back to the standard OpenAI endpoint when unset.
+    """
+    api_key: str = os.environ.get(OPENAI_API_KEY_ENV_VAR, "")
+    base_url: str = os.environ.get(OPENAI_BASE_URL_ENV_VAR, DEFAULT_OPENAI_BASE_URL)
+    log.info(f"{base_url=}")
+    return AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+
+# ──────────────────────────────────────────────
+# PIPELINE ORCHESTRATION
+# ──────────────────────────────────────────────
+
+
+async def run_validation_pipeline(
+    input_path: str,
+    output_path: str,
+    model: str,
+    max_tokens: int,
+    max_concurrency: int,
+    load_from_output_cache_file: bool = False,
+    progress_file: str | None = DEFAULT_PROGRESS_FILE,
+) -> None:
+    """Load rows, validate with LLM, and write results to JSONL.
+
+    When ``load_from_output_cache_file`` is True, reads the existing output
+    file, skips custom_ids that are already validated, and only re-runs the
+    pipeline for the remaining rows. The merged result is written back to
+    ``output_path``. At the end, logs how many rows are still unvalidated.
+    """
+    all_input_rows = read_scenario_query_prompt_rows(input_path)
+    log.info(f"{input_path=} total {len(all_input_rows)=}")
+
+    existing_validated: list[ValidatedTrainingData] = []
+    if load_from_output_cache_file:
+        existing_validated = read_validated_training_data_jsonl(output_path)
+        already_done_ids = {row.custom_id for row in existing_validated}
+        rows = [r for r in all_input_rows if r.custom_id not in already_done_ids]
+        log.info(
+            f"Cache mode: {len(existing_validated)=} already done, {len(rows)=} to re-run"
+        )
+    else:
+        rows = all_input_rows
+
+    client = _build_async_openai_client()
+    results = await validate_all_rows(rows, client, model, max_tokens, max_concurrency, progress_file=progress_file)
+
+    newly_validated: list[ValidatedTrainingData] = []
+    failed_ids: list[str] = []
+    for row, model_output in results:
+        if model_output is None:
+            log.warning(f"Skipping failed row: {row.custom_id=}")
+            failed_ids.append(row.custom_id)
+            continue
+        newly_validated.append(build_validated_training_data(row, model_output))
+
+    log.info(f"{len(newly_validated)=} {len(failed_ids)=}")
+    if failed_ids:
+        log.warning(f"{failed_ids=}")
+
+    combined = existing_validated + newly_validated
+    validated_ids = {r.custom_id for r in combined}
+    still_left = [r for r in all_input_rows if r.custom_id not in validated_ids]
+    log.info(f"Still left to validate: {len(still_left)}")
+    if still_left:
+        log.warning(f"still_left_ids={[r.custom_id for r in still_left]}")
+
+    write_validated_training_data_jsonl(combined, output_path)
+
+
+# ──────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────
+
+
+class ValidationPipelineCli:
+    """CLI entry point for the data validation pipeline."""
+
+    def run(
+        self,
+        input_path: str = DEFAULT_INPUT_PATH,
+        output_path: str = DEFAULT_OUTPUT_PATH,
+        model: str = DEFAULT_VALIDATION_MODEL,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+        load_from_output_cache_file: bool = True,
+    ) -> None:
+        """Validate ScenarioQueryPromptRowDataModel rows and write validated JSONL.
+
+        Reads rows from ``input_path``, calls the LLM for each row (up to
+        ``max_concurrency`` in-flight at once), and writes results to ``output_path``.
+        Rows that fail LLM validation are skipped with a warning log.
+
+        When ``load_from_output_cache_file`` is True, loads the existing
+        ``output_path`` file, skips already-validated custom_ids, re-runs only
+        the failing rows, merges results, and logs how many rows are still left.
+
+        Example::
+
+            uv run python ast_skills/train/validate_training_data.py run \\
+                --input_path artifacts/scenario_query_prompt_row_data_models.jsonl \\
+                --output_path artifacts/validated_training_data.jsonl \\
+                --model gpt-4o \\
+                --max_concurrency 20 \\
+                --load_from_output_cache_file true
+        """
+        log.info(
+            f"{input_path=} {output_path=} {model=} {max_tokens=} "
+            f"{max_concurrency=} {load_from_output_cache_file=}"
+        )
+        asyncio.run(
+            run_validation_pipeline(
+                input_path=input_path,
+                output_path=output_path,
+                model=model,
+                max_tokens=max_tokens,
+                max_concurrency=max_concurrency,
+                load_from_output_cache_file=load_from_output_cache_file,
+            )
+        )
+
+    def smoke_test(
+        self,
+        input_path: str = DEFAULT_INPUT_PATH,
+        smoke_input_path: str = DEFAULT_SMOKE_INPUT_PATH,
+        smoke_output_path: str = DEFAULT_SMOKE_OUTPUT_PATH,
+        num_samples: int = DEFAULT_SMOKE_NUM_SAMPLES,
+        model: str = DEFAULT_VALIDATION_MODEL,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> None:
+        """Run the full pipeline on a random sample to verify end-to-end correctness.
+
+        Reads all rows from ``input_path``, randomly picks ``num_samples`` of them,
+        writes the sample to ``smoke_input_path``, runs the pipeline, and writes
+        results to ``smoke_output_path``.
+
+        Example::
+
+            uv run python ast_skills/train/validate_training_data.py smoke_test \\
+                --input_path artifacts/scenario_query_prompt_row_data_models.jsonl \\
+                --num_samples 2
+        """
+        log.info(f"{input_path=} {num_samples=} {smoke_input_path=} {smoke_output_path=}")
+        all_rows = read_scenario_query_prompt_rows(input_path)
+        log.info(f"Total rows loaded: {len(all_rows)=}")
+
+        sampled = sample_rows(all_rows, num_samples)
+        write_sampled_rows_jsonl(sampled, smoke_input_path)
+
+        asyncio.run(
+            run_validation_pipeline(
+                input_path=smoke_input_path,
+                output_path=smoke_output_path,
+                model=model,
+                max_tokens=max_tokens,
+                max_concurrency=num_samples,
+            )
+        )
+        log.info(f"Smoke test complete. Results at {smoke_output_path=}")
+
+
+if __name__ == "__main__":
+    fire.Fire(ValidationPipelineCli)
