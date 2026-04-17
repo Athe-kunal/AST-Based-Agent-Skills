@@ -27,3 +27,12 @@ class SeedQuestionsTrainingData:
     question: str
     in_batch_negatives_question_wrt_descriptions: list[str]
     in_batch_negatives_question_wrt_summaries: list[str]
+
+@dataclass()
+class ValidatedTrainingData:
+    custom_id: str
+    name: str
+    markdown_content: str
+    filtered_summary: str #coming from LLM
+    description: str
+    filtered_questions: list[str] #coming from LLM
