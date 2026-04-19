@@ -68,11 +68,10 @@ async def _encode_texts_async(
     embedding_model: str,
     texts: Sequence[str],
     batch_size: int,
-    max_concurrency: int,
+    semaphore: asyncio.Semaphore,
 ) -> np.ndarray:
     """Encodes texts with async vLLM embeddings and L2 normalization."""
     chunks = _chunk_texts(texts=texts, batch_size=batch_size)
-    semaphore = asyncio.Semaphore(max_concurrency)
     tasks = [
         _fetch_embeddings_chunk(
             client=client,
@@ -163,6 +162,7 @@ async def _select_row_questions_async(
     client: AsyncOpenAI,
     row: ValidatedSkillQuestionRow,
     config: MmrSelectionConfig,
+    semaphore: asyncio.Semaphore,
 ) -> tuple[str, list[str]]:
     """Selects diverse questions for one validated row."""
     normalized_questions = _normalize_questions(row.filtered_questions)
@@ -171,7 +171,7 @@ async def _select_row_questions_async(
         embedding_model=config.embedding_model,
         texts=normalized_questions,
         batch_size=config.batch_size,
-        max_concurrency=config.max_concurrency,
+        semaphore=semaphore,
     )
     similarity_matrix = _compute_similarity_matrix(embeddings=embeddings)
     selected_indices = _select_mmr_indices(
@@ -192,11 +192,13 @@ async def select_diverse_questions_for_rows(
 ) -> dict[str, list[str]]:
     """Selects diverse questions for all rows via async vLLM embeddings."""
     client = AsyncOpenAI(base_url=config.base_url, api_key=config.api_key)
+    semaphore = asyncio.Semaphore(config.max_concurrency)
     tasks = [
         _select_row_questions_async(
             client=client,
             row=row,
             config=config,
+            semaphore=semaphore,
         )
         for row in rows
     ]

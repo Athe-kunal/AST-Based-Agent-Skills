@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -46,4 +46,5 @@ class ValidatedSkillQuestionRow:
     num_from_scenario_questions: str
     num_from_seed_questions: str
     reasoning: str
-    summary: str = ""
+    summary: str
+    mmr_questions: list[str] = field(default_factory=list)

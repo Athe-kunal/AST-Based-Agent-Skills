@@ -12,6 +12,16 @@ FIELD ?= description
 TOP_K ?= 10
 QUERY ?= I want to read pdf 
 
+MMR_PORT ?= 8001
+MMR_GPU_DEVICE ?= 3
+MMR_MODEL ?= Qwen/Qwen3-Embedding-8B
+MMR_GPU_MEMORY_UTILIZATION ?= 0.5
+MMR_BASE_URL ?= http://127.0.0.1:$(MMR_PORT)/v1
+MMR_API_KEY ?= EMPTY
+MMR_LAMBDA ?= 0.5
+MMR_BATCH_SIZE ?= 64
+MMR_MAX_CONCURRENCY ?= 32
+
 TRAIN_CONFIG_PATH ?= configs/train.yaml
 EVAL_CONFIG_PATH ?= configs/train.yaml
 
@@ -23,6 +33,25 @@ vllm-embd-serve:
 		--max-model-len 8192 \
 		--port $(EMBD_PORT) \
 		--host $(SERVER)
+
+.PHONY: vllm-mmr-serve
+vllm-mmr-serve:
+	CUDA_VISIBLE_DEVICES=$(MMR_GPU_DEVICE) uv run vllm serve $(MMR_MODEL) \
+		--gpu-memory-utilization $(MMR_GPU_MEMORY_UTILIZATION) \
+		--runner pooling \
+		--max-model-len 8192 \
+		--port $(MMR_PORT) \
+		--host $(SERVER)
+
+.PHONY: build-dataset
+build-dataset:
+	uv run python -m ast_skills.train.build_dataset \
+		--base_url $(MMR_BASE_URL) \
+		--api_key $(MMR_API_KEY) \
+		--embedding_model $(MMR_MODEL) \
+		--mmr_lambda $(MMR_LAMBDA) \
+		--batch_size $(MMR_BATCH_SIZE) \
+		--max_concurrency $(MMR_MAX_CONCURRENCY)
 
 .PHONY: build-retriever-chroma
 build-retriever-chroma:
